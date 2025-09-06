@@ -259,15 +259,24 @@ def best_practice_answer(query: str) -> str:
     return chat.choices[0].message.content.strip()
 
 def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
+    """Retrieve from Chroma and answer; fall back to best-practice if low confidence or slow."""
+    import time
+
+    # Use fewer neighbors in FAST_MODE to keep latency safely under Twilio's 15s
+    k = 3 if FAST_MODE else K
+
     # 1) Retrieve with RAW user question
+    t0 = time.time()
     res = collection.query(
         query_texts=[raw_question],
-        n_results=K,
-        include=["documents", "distances"]
+        n_results=k,
+        include=["documents", "distances"],
     )
+    t1 = time.time()
+    print(f"[TIMING] chroma.query took {t1 - t0:.2f}s")
+
     docs  = res.get("documents", [[]])[0]
     dists = res.get("distances", [[]])[0]
-
     top_distance = dists[0] if dists else None
 
     # Debug logs
@@ -275,8 +284,9 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
     if top_distance is not None:
         print(f"Top distance={top_distance:.3f} | approx cosine_similarity={1 - top_distance:.3f}")
     if docs:
-        print("Top doc snippet:", docs[0][:240])
+        print("Top doc snippet:", (docs[0] or "")[:240])
 
+    # If nothing returned, go straight to best-practice
     if not docs or not dists:
         text = best_practice_answer(raw_question)
         telemetry = {
@@ -284,25 +294,42 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
             "confident": False,
             "top_distance": top_distance,
             "distances": dists,
-            "used_fallback": True
+            "used_fallback": True,
         }
         return text, False, telemetry
 
     # 2) Distance gate
-    confident = top_distance <= CONF_THRESH
+    confident = (top_distance is not None) and (top_distance <= CONF_THRESH)
 
-    # 3) Keyword sanity gate
+    # 3) Lightweight keyword sanity check
     if confident and not rough_keyword_match(raw_question, docs[0]):
         confident = False
 
+    # Optional extra guard: if we're far beyond threshold, bail early
+    if not confident and top_distance is not None and top_distance > (CONF_THRESH + 0.10):
+        text = best_practice_answer(raw_question)
+        telemetry = {
+            "from_pdf": False,
+            "confident": False,
+            "top_distance": top_distance,
+            "distances": dists,
+            "used_fallback": True,
+        }
+        print("[Fallback] Distance well above threshold; skipping RAG.")
+        return text, False, telemetry
+
     if confident:
         # 4) Generate from posts context
+        t2 = time.time()
         text = rag_answer_from_posts(effective_query, docs)
-        # 5) Post-generation guard: if RAG admits missing info, fall back
-        if any(p in text.lower() for p in [
+        t3 = time.time()
+        print(f"[TIMING] rag_answer_from_posts (chat) took {t3 - t2:.2f}s")
+
+        # 5) Post-generation guard: if RAG says missing info, fall back
+        if any(p in (text or "").lower() for p in [
             "don't have that information",
             "not in the context",
-            "context does not cover"
+            "context does not cover",
         ]):
             print("[RAG->Fallback] RAG reported missing info; using best-practice.")
             text = best_practice_answer(raw_question)
@@ -311,7 +338,7 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
                 "confident": False,
                 "top_distance": top_distance,
                 "distances": dists,
-                "used_fallback": True
+                "used_fallback": True,
             }
             return text, False, telemetry
 
@@ -321,10 +348,11 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
             "confident": True,
             "top_distance": top_distance,
             "distances": dists,
-            "used_fallback": False
+            "used_fallback": False,
         }
         return text, True, telemetry
 
+    # If not confident, use best-practice fallback
     print("[Fallback] Weak distance or keyword overlap; using best-practice.")
     text = best_practice_answer(raw_question)
     telemetry = {
@@ -332,9 +360,10 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
         "confident": False,
         "top_distance": top_distance,
         "distances": dists,
-        "used_fallback": True
+        "used_fallback": True,
     }
     return text, False, telemetry
+
 
 
 def is_first_turn(sender: str) -> bool:
@@ -362,6 +391,12 @@ def whatsapp_reply():
     if user_text.strip().lower() == "ping":
         resp = MessagingResponse()
         resp.message("pong")
+        return str(resp)
+    # quick path to test chat-only (skips RAG)
+    if user_text.strip().lower().startswith("!fast "):
+        query = user_text.split(" ", 1)[1]
+        reply_text = best_practice_answer(query)  # single chat call
+        resp = MessagingResponse(); resp.message(sanitize_plain(reply_text))
         return str(resp)
 
     sender = (request.form.get("From") or "").strip()
