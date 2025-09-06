@@ -65,6 +65,8 @@ COLLECTION = "linkedin_posts"
 EMBED_MODEL = "text-embedding-3-small"  # for RAG
 CHAT_MODEL = "gpt-4o-mini"              # switchable chat model
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")          # set on Render to protect /stats
+FAST_MODE = os.getenv("FAST_MODE") == "1"
+
 # Retrieval tuning
 K = 6
 CONF_THRESH = 1.05
@@ -375,6 +377,16 @@ def whatsapp_reply():
 
     # --- continue with your existing pipeline ---
     remember_turn(sender, "user", user_text)
+
+    if FAST_MODE:
+        # Skip extra OpenAI calls to avoid Twilio 15s timeout
+        profile = get_profile(sender)   # keep whatever we already know
+        summary = ""                    # skip summarize_history
+    else:
+        extract_profile_updates(sender, user_text)
+        summary = summarize_history(sender)
+        profile = get_profile(sender)
+
     extract_profile_updates(sender, user_text)
     summary = summarize_history(sender)
     profile = get_profile(sender)
