@@ -40,16 +40,18 @@ def main():
         raise FileNotFoundError(f"No PDFs found in {DATA_DIR}/")
 
     # Chroma setup
-    client = chromadb.PersistentClient(path=DB_PATH)
-    # Do NOT delete collection every time; we will upsert to avoid duplicates
+    client = chromadb.PersistentClient(path=os.getenv("DB_PATH", "./db"))
+
+    openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+    api_key=os.environ["OPENAI_API_KEY"],
+    model_name=EMBED_MODEL,
+    )
     try:
-        col = client.get_collection(COLLECTION)
+        col = client.get_collection(name=COLLECTION, embedding_function=openai_ef)
     except Exception:
-        openai_ef = embedding_functions.OpenAIEmbeddingFunction(
-            api_key=os.environ["OPENAI_API_KEY"], model_name=EMBED_MODEL
-        )
         col = client.create_collection(name=COLLECTION, embedding_function=openai_ef)
 
+    
     total_chunks = 0
 
     for path in pdf_paths:
