@@ -110,7 +110,7 @@ if not os.environ.get("OPENAI_API_KEY"):
     raise RuntimeError("Set OPENAI_API_KEY environment variable before starting Flask.")
 
 # -------------------- Clients --------------------
-openai_client = OpenAI()
+openai_client = OpenAI(timeout=8)
 
 # Chroma vector store
 chroma_client = chromadb.PersistentClient(path=DB_PATH)
@@ -386,10 +386,6 @@ def whatsapp_reply():
         extract_profile_updates(sender, user_text)
         summary = summarize_history(sender)
         profile = get_profile(sender)
-
-    extract_profile_updates(sender, user_text)
-    summary = summarize_history(sender)
-    profile = get_profile(sender)
 
     effective_query = build_effective_query(user_text, profile, summary)
     answer, from_pdf, telemetry = answer_from_pdf_or_fallback(user_text, effective_query)
