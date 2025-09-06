@@ -60,7 +60,7 @@ def log_interaction(sender: str, payload: dict):
 app = Flask(__name__)
 
 # -------------------- Config --------------------
-DB_PATH = "./db"
+DB_PATH = os.getenv("DB_PATH", "./db")
 COLLECTION = "linkedin_posts"
 EMBED_MODEL = "text-embedding-3-small"  # for RAG
 CHAT_MODEL = "gpt-4o-mini"              # switchable chat model
