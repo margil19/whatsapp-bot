@@ -22,7 +22,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "interactions.jsonl")
 
 # Async logging setup to avoid blocking request path
-_LOG_QUEUE: TQueue[Tuple[str, Dict[str, Any]]] = Queue(maxsize=1000)
+_LOG_QUEUE: "queue.Queue[tuple[str, dict]]" = queue.Queue(maxsize=1000)
 def _log_writer():
     while True:
         try:
