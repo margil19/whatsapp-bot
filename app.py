@@ -1,4 +1,3 @@
-# app.py
 import os
 import time
 import json
@@ -16,13 +15,33 @@ from openai import OpenAI
 import re
 from functools import lru_cache
 
-# Prefer Render’s mount if available, else fallback to ./logs
+# -------------------- Paths & logging --------------------
 LOG_DIR = os.getenv("LOG_DIR", "./logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "interactions.jsonl")
 
-# Async logging setup to avoid blocking request path
+def _ensure_log_dir():
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+def _mask_sender(sender: str) -> str:
+    h = hashlib.sha256((sender or "").encode()).hexdigest()
+    return f"u_{h[:10]}"
+
+def sanitize_plain(text: str) -> str:
+    if not text:
+        return text
+    text = re.sub(r'[*_`~]+', '', text)               # strip markdown markers
+    text = re.sub(r'[\u200b-\u200d\uFEFF]', '', text)  # zero-width chars
+    text = re.sub(r'^[•\-\u2022\>]\s*', '- ', text, flags=re.MULTILINE)
+    text = re.sub(r'[ \t]+', ' ', text)
+    return text.strip()
+
+# Async logging (non-blocking)
 _LOG_QUEUE: "queue.Queue[tuple[str, dict]]" = queue.Queue(maxsize=1000)
+
 def _log_writer():
     while True:
         try:
@@ -30,12 +49,11 @@ def _log_writer():
             if sender is None:
                 continue
             _ensure_log_dir()
-            path = os.path.join(LOG_DIR, "interactions.jsonl")
             payload = dict(payload)
             payload["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             payload["sender_masked"] = _mask_sender(sender)
             payload.pop("sender", None)
-            with open(path, "a", encoding="utf-8") as f:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception as e:
             print("log_writer error:", e)
@@ -45,49 +63,46 @@ def _log_writer():
             except Exception:
                 pass
 
-_log_thread = threading.Thread(target=_log_writer, daemon=True)
-_log_thread.start()
-
-
-def sanitize_plain(text: str) -> str:
-    if not text: return text
-    # Remove bold/italic markers and odd zero-width chars
-    text = re.sub(r'[*_`~]+', '', text)              # strip markdown markers
-    text = re.sub(r'[\u200b-\u200d\uFEFF]', '', text) # zero-width chars
-    # Normalize bullets to "- "
-    text = re.sub(r'^[•\-\u2022\>]\s*', '- ', text, flags=re.MULTILINE)
-    # Collapse extra spaces
-    text = re.sub(r'[ \t]+', ' ', text)
-    return text.strip()
-
-def _ensure_log_dir():
-    try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-    except Exception:
-        pass
-
-def _mask_sender(sender: str) -> str:
-    # avoid storing raw phone numbers
-    h = hashlib.sha256((sender or "").encode()).hexdigest()
-    return f"u_{h[:10]}"
+threading.Thread(target=_log_writer, daemon=True).start()
 
 def log_interaction(sender: str, payload: dict):
-    """Append one JSON line to logs/interactions.jsonl"""
     try:
         _LOG_QUEUE.put_nowait((sender, payload))
     except Exception:
-        # As a fallback, avoid dropping telemetry entirely
+        print("log_interaction: queue full; dropping log line.")
+
+# -------------------- Deferred worker (post-reply) --------------------
+_DEFER_QUEUE: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=1000)
+
+def _defer_worker():
+    # Runs OUTSIDE the Twilio webhook response path
+    while True:
         try:
-            _ensure_log_dir()
-            path = os.path.join(LOG_DIR, "interactions.jsonl")
-            payload = dict(payload)
-            payload["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            payload["sender_masked"] = _mask_sender(sender)
-            payload.pop("sender", None)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            sender, user_text = _DEFER_QUEUE.get()
+            if not sender:
+                continue
+            # Heuristics: only run one of these per deferred cycle
+            if _looks_like_profile_update(user_text):
+                try:
+                    extract_profile_updates(sender, user_text)
+                except Exception as e:
+                    print("defer extract_profile_updates error:", e)
+            else:
+                # Summarize every ~3 user turns if we have some history
+                if len(CONV_HISTORY.get(sender, [])) >= 3:
+                    try:
+                        summarize_history(sender)
+                    except Exception as e:
+                        print("defer summarize_history error:", e)
         except Exception as e:
-            print("log_interaction error:", e)
+            print("defer worker error:", e)
+        finally:
+            try:
+                _DEFER_QUEUE.task_done()
+            except Exception:
+                pass
+
+threading.Thread(target=_defer_worker, daemon=True).start()
 
 # -------------------- Flask --------------------
 app = Flask(__name__)
@@ -95,29 +110,39 @@ app = Flask(__name__)
 # -------------------- Config --------------------
 DB_PATH = os.getenv("DB_PATH", "./db")
 COLLECTION = "linkedin_posts"
-EMBED_MODEL = "text-embedding-3-small"  # for RAG
-CHAT_MODEL = "gpt-4o-mini"              # switchable chat model
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")          # set on Render to protect /stats
-FAST_MODE = os.getenv("FAST_MODE") == "1"
+EMBED_MODEL = "text-embedding-3-small"
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+DEBUG = os.getenv("DEBUG") == "1"
 
-# Retrieval tuning
-K = 6
-CONF_THRESH = 1.05
+# Retrieval / budget tuning
+K = int(os.getenv("K", "3"))
+CONF_DIST = float(os.getenv("CONF_DIST", "0.35"))   # cosine distance; lower=closer
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "150"))
+RETRIEVAL_BUDGET = float(os.getenv("RETRIEVAL_BUDGET", "1.2"))
+TURN_BUDGET = float(os.getenv("TURN_BUDGET", "10.0"))  # leave ~5s headroom for network/Twilio
 
-# Conversational memory
+# Clients
+if not os.environ.get("OPENAI_API_KEY"):
+    raise RuntimeError("Set OPENAI_API_KEY before starting Flask.")
+openai_client = OpenAI(timeout=5, max_retries=0)
+
+chroma_client = chromadb.PersistentClient(path=DB_PATH)
+openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+    api_key=os.environ["OPENAI_API_KEY"], model_name=EMBED_MODEL
+)
+collection = chroma_client.get_or_create_collection(
+    name=COLLECTION, embedding_function=openai_ef
+)
+
+# Stores
 MAX_HISTORY = 10
-
-# In-memory stores
 USER_PROFILE = {}
 CONV_HISTORY = {}
 CONV_SUMMARY = {}
-# Track who has already seen the welcome menu
 WELCOME_SEEN = set()
 SENDER_TURN_COUNT = {}
-
-# Simple in-process caches to reduce repeated work
 _CHROMA_CACHE = {}
-
 
 # ---- Welcome menu / examples ----
 WELCOME_QUESTIONS = [
@@ -129,7 +154,6 @@ WELCOME_QUESTIONS = [
     "How do I use the STAR method to answer behavioral questions?",
     "How can I stay consistent in my job search without burning out?"
 ]
-
 WELCOME_MENU = (
     "Hi! I can help with job search.\n"
     "Reply with a number or type your own question:\n\n"
@@ -142,40 +166,14 @@ WELCOME_MENU = (
     "7) Stay consistent / avoid burnout\n\n"
     "Or type 'menu' anytime to see this again."
 )
-# -------------------- Safety --------------------
-if not os.environ.get("OPENAI_API_KEY"):
-    raise RuntimeError("Set OPENAI_API_KEY environment variable before starting Flask.")
 
-# -------------------- Clients --------------------
-openai_client = OpenAI(timeout=8, max_retries=1)
-
-# Chroma vector store
-chroma_client = chromadb.PersistentClient(path=DB_PATH)
-openai_ef = embedding_functions.OpenAIEmbeddingFunction(
-    api_key=os.environ["OPENAI_API_KEY"], model_name=EMBED_MODEL
-)
-collection = chroma_client.get_or_create_collection(
-    name=COLLECTION, embedding_function=openai_ef
-)
-
-# Startup sanity log
-try:
-    count = collection.count() if hasattr(collection, "count") else "n/a"
-    print(f"Chroma collection '{COLLECTION}' count:", count)
-except Exception as e:
-    print("Could not count Chroma docs:", e)
-
-# -------------------- Safe wrapper --------------------
+# -------------------- Helpers --------------------
 def safe_chat_completion(model, messages, temperature=None, max_tokens=None):
-    kwargs = {"model": model, "messages": messages}
-    # Only pass temperature if model supports it (o1-family requires default)
+    kwargs = {"model": model, "messages": messages, "max_tokens": max_tokens or MAX_TOKENS}
     if temperature is not None and not model.startswith("o1"):
         kwargs["temperature"] = temperature
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
     return openai_client.chat.completions.create(**kwargs)
 
-# -------------------- Utilities --------------------
 def remember_turn(sender: str, role: str, text: str) -> None:
     hist = CONV_HISTORY.get(sender) or []
     hist.append({"role": role, "text": text})
@@ -201,14 +199,11 @@ def embed_text(text: str):
     emb = openai_client.embeddings.create(model=EMBED_MODEL, input=text)
     return emb.data[0].embedding
 
-# ---- Lightweight keyword sanity check for RAG ----
 def rough_keyword_match(q: str, doc: str, min_overlap: int = 2) -> bool:
-    """Require a minimal overlap of 4+ letter words to accept a chunk as on-topic."""
     q_words = set(re.findall(r"[a-zA-Z]{4,}", (q or "").lower()))
     d_words = set(re.findall(r"[a-zA-Z]{4,}", (doc or "").lower()))
     return len(q_words & d_words) >= min_overlap
 
-# -------------------- Memory updaters --------------------
 def summarize_history(sender: str) -> str:
     last = CONV_HISTORY.get(sender, [])
     prior = CONV_SUMMARY.get(sender, "")
@@ -221,50 +216,56 @@ def summarize_history(sender: str) -> str:
         "Recent messages:\n" + "\n".join(f"{t['role']}: {t['text']}" for t in last[-4:]) +
         "\n\nUpdate the summary in <= 40 words:"
     )
-    chat = safe_chat_completion(
-        CHAT_MODEL,
-        messages=[{"role":"system","content":sys},{"role":"user","content":content}],
-        temperature=0.2
-    )
-    new_summary = chat.choices[0].message.content.strip()
-    CONV_SUMMARY[sender] = new_summary
-    return new_summary
+    try:
+        chat = safe_chat_completion(
+            CHAT_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": content}],
+            temperature=0.2
+        )
+        new_summary = chat.choices[0].message.content.strip()
+        CONV_SUMMARY[sender] = new_summary
+        return new_summary
+    except Exception as e:
+        print("summarize_history error:", e)
+        return prior or ""
 
 def extract_profile_updates(sender: str, user_text: str) -> None:
     sys = (
         "Extract a careers profile as strict JSON (no code block). "
         "Allowed keys: role, level, location, years, industry, goals, links."
     )
-    chat = safe_chat_completion(
-        CHAT_MODEL,
-        messages=[{"role":"system","content":sys},{"role":"user","content":user_text}]
-    )
-    prof = get_profile(sender)
     try:
-        data = json.loads(chat.choices[0].message.content)
-        text_l = (user_text or "").lower()
-        for k, v in data.items():
-            if not v:
-                continue
-            if k == "links" and isinstance(v, list):
-                prof["links"] = list({*prof.get("links", []), *v})
-            elif k == "role":
-                # Only update role if the user hints at it explicitly in THIS message
-                if any(t in text_l for t in ["role", "target", "position", "title", "aiming", "interested in"]):
-                    prof["role"] = v
-            else:
-                prof[k] = v
-        USER_PROFILE[sender] = prof
-    except Exception:
-        # tolerate parsing issues silently
-        pass
+        chat = safe_chat_completion(
+            CHAT_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user_text}]
+        )
+        prof = get_profile(sender)
+        try:
+            data = json.loads(chat.choices[0].message.content)
+            text_l = (user_text or "").lower()
+            for k, v in data.items():
+                if not v:
+                    continue
+                if k == "links" and isinstance(v, list):
+                    prof["links"] = list({*prof.get("links", []), *v})
+                elif k == "role":
+                    if any(t in text_l for t in ["role", "target", "position", "title", "aiming", "interested in"]):
+                        prof["role"] = v
+                else:
+                    prof[k] = v
+            USER_PROFILE[sender] = prof
+        except Exception:
+            pass
+    except Exception as e:
+        print("extract_profile_updates error:", e)
 
-PROFILE_HINT_RE = re.compile(r"\b(role|position|title|senior|junior|mid|years|experience|exp|location|remote|hybrid|onsite|industry|domain|target|aiming|interested|looking)\b|https?://", re.I)
-
+PROFILE_HINT_RE = re.compile(
+    r"\b(role|position|title|senior|junior|mid|years|experience|exp|location|remote|hybrid|onsite|industry|domain|target|aiming|interested|looking)\b|https?://",
+    re.I
+)
 def _looks_like_profile_update(text: str) -> bool:
     return bool(PROFILE_HINT_RE.search(text or ""))
 
-# -------------------- Planner & answering --------------------
 def build_effective_query(user_msg: str, profile: dict, summary: str) -> str:
     parts = [user_msg]
     if profile.get("role"): parts.append(f"Target role: {profile['role']}")
@@ -286,13 +287,17 @@ def rag_answer_from_posts(question: str, docs: list[str]) -> str:
         "Use plain text only."
     )
     user = f"Context:\n{context}\n\nQuestion: {question}"
-    chat = safe_chat_completion(
-        CHAT_MODEL,
-        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-        temperature=0.2,
-        max_tokens=220
-    )
-    return chat.choices[0].message.content.strip()
+    try:
+        chat = safe_chat_completion(
+            CHAT_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0.2,
+            max_tokens=MAX_TOKENS
+        )
+        return chat.choices[0].message.content.strip()
+    except Exception as e:
+        print("rag_answer_from_posts error:", e)
+        return ""
 
 def best_practice_answer(query: str) -> str:
     sys = (
@@ -300,150 +305,30 @@ def best_practice_answer(query: str) -> str:
         "Use plain text only. Keep it under 120 words. "
         "Do not assume a specific role, level, or industry unless the user states it explicitly in THIS message."
     )
-    chat = safe_chat_completion(
-        CHAT_MODEL,
-        messages=[{"role":"system","content":sys},{"role":"user","content":query}],
-        temperature=0.3,
-        max_tokens=220
-    )
-    return chat.choices[0].message.content.strip()
-
-def answer_from_pdf_or_fallback(raw_question: str, effective_query: str, time_budget: float | None = None):
-    """Retrieve from Chroma and answer; fall back to best-practice if low confidence or slow."""
-    import time
-
-    # Hard time budget for RAG path (seconds). Fallback if exceeded.
-    default_budget = float(os.getenv("RAG_TIME_BUDGET", "8.0"))
-    TIME_BUDGET = min(time_budget, default_budget) if time_budget else default_budget
-
-    # Use fewer neighbors in FAST_MODE to keep latency safely under Twilio's 15s
-    k = 3 if FAST_MODE else K
-
-    # 1) Retrieve with RAW user question
-    t0 = time.time()
-    cache_key = (raw_question, k)
-    if cache_key in _CHROMA_CACHE:
-        res = _CHROMA_CACHE[cache_key]
-    else:
-        res = collection.query(
-            query_texts=[raw_question],
-            n_results=k,
-            include=["documents", "distances"],
+    try:
+        chat = safe_chat_completion(
+            CHAT_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": query}],
+            temperature=0.3,
+            max_tokens=MAX_TOKENS
         )
-        _CHROMA_CACHE[cache_key] = res
-    t1 = time.time()
-    print(f"[TIMING] chroma.query took {t1 - t0:.2f}s")
+        return chat.choices[0].message.content.strip()
+    except Exception as e:
+        print("best_practice_answer error:", e)
+        return "Here’s a quick take: clarify your goal, focus on what you can control this week, and take one small step today. Share role/level if you want a more tailored answer."
 
-    # If we've already blown the budget, answer fast
-    if (t1 - t0) > TIME_BUDGET * 0.6:
-        text = best_practice_answer_cached(raw_question)
-        telemetry = {
-            "from_pdf": False,
-            "confident": False,
-            "top_distance": None,
-            "distances": None,
-            "used_fallback": True,
-            "reason": "budget_after_retrieval"
-        }
-        print("[Fallback] Retrieval exceeded time budget; using best-practice.")
-        return text, False, telemetry
+# ---- heuristics to control expensive work ----
+def looks_generic(msg: str) -> bool:
+    if not msg: return True
+    m = msg.strip().lower()
+    if len(m) < 80: return True
+    return any(w in m for w in ["help", "tips", "advice", "how to start"]) and len(m) < 140
 
-    docs  = res.get("documents", [[]])[0]
-    dists = res.get("distances", [[]])[0]
-    top_distance = dists[0] if dists else None
-
-    # Debug logs
-    print("Distances:", dists)
-    if top_distance is not None:
-        print(f"Top distance={top_distance:.3f} | approx cosine_similarity={1 - top_distance:.3f}")
-    if docs:
-        print("Top doc snippet:", (docs[0] or "")[:240])
-
-    # If nothing returned, go straight to best-practice
-    if not docs or not dists:
-        text = best_practice_answer_cached(raw_question)
-        telemetry = {
-            "from_pdf": False,
-            "confident": False,
-            "top_distance": top_distance,
-            "distances": dists,
-            "used_fallback": True,
-        }
-        return text, False, telemetry
-
-    # 2) Distance gate
-    confident = (top_distance is not None) and (top_distance <= CONF_THRESH)
-
-    # 3) Lightweight keyword sanity check
-    if confident and not rough_keyword_match(raw_question, docs[0]):
-        confident = False
-
-    # Optional extra guard: if we're far beyond threshold, bail early
-    if not confident and top_distance is not None and top_distance > (CONF_THRESH + 0.10):
-        text = best_practice_answer_cached(raw_question)
-        telemetry = {
-            "from_pdf": False,
-            "confident": False,
-            "top_distance": top_distance,
-            "distances": dists,
-            "used_fallback": True,
-        }
-        print("[Fallback] Distance well above threshold; skipping RAG.")
-        return text, False, telemetry
-
-    if confident:
-        # 4) Generate from posts context
-        t2 = time.time()
-        # If we're close to the budget, skip RAG generation
-        if (t2 - t0) > TIME_BUDGET * 0.8:
-            text = best_practice_answer_cached(raw_question)
-            t3 = time.time()
-            print("[Fallback] Near budget before generation; using best-practice.")
-        else:
-            text = rag_answer_from_posts(effective_query, docs)
-            t3 = time.time()
-        print(f"[TIMING] rag_answer_from_posts (chat) took {t3 - t2:.2f}s")
-
-        # 5) Post-generation guard: if RAG says missing info, fall back
-        if any(p in (text or "").lower() for p in [
-            "don't have that information",
-            "not in the context",
-            "context does not cover",
-        ]):
-            print("[RAG->Fallback] RAG reported missing info; using best-practice.")
-            text = best_practice_answer_cached(raw_question)
-            telemetry = {
-                "from_pdf": False,
-                "confident": False,
-                "top_distance": top_distance,
-                "distances": dists,
-                "used_fallback": True,
-            }
-            return text, False, telemetry
-
-        print("[RAG] Answered from PDF.")
-        telemetry = {
-            "from_pdf": True,
-            "confident": True,
-            "top_distance": top_distance,
-            "distances": dists,
-            "used_fallback": False,
-        }
-        return text, True, telemetry
-
-    # If not confident, use best-practice fallback
-    print("[Fallback] Weak distance or keyword overlap; using best-practice.")
-    text = best_practice_answer_cached(raw_question)
-    telemetry = {
-        "from_pdf": False,
-        "confident": False,
-        "top_distance": top_distance,
-        "distances": dists,
-        "used_fallback": True,
-    }
-    return text, False, telemetry
-
-
+def wants_rag(msg: str) -> bool:
+    if not msg: return False
+    m = msg.lower()
+    if len(m) >= 120: return True
+    return any(k in m for k in ["from my posts", "as i wrote", "from the pdf", "context above"])
 
 def is_first_turn(sender: str) -> bool:
     return sender not in WELCOME_SEEN
@@ -451,12 +336,12 @@ def is_first_turn(sender: str) -> bool:
 def map_menu_choice_to_query(text: str) -> str | None:
     t = (text or "").strip().lower()
     if t == "menu": return "__MENU__"
-    if t.isdigit():
-        i = int(t) - 1
+    m = re.match(r'^\s*(\d+)\s*\)?\s*$', t)
+    if m:
+        i = int(m.group(1)) - 1
         if 0 <= i < len(WELCOME_QUESTIONS):
             return WELCOME_QUESTIONS[i]
     return None
-
 
 # -------------------- Routes --------------------
 @app.route("/", methods=["GET"])
@@ -465,102 +350,110 @@ def health():
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_reply():
-    t_start = time.time()
+    t0 = time.time()
     user_text = (request.form.get("Body") or "").strip()
-    # ultra-fast ping to confirm Twilio <-> Render path
-    if user_text.strip().lower() == "ping":
-        resp = MessagingResponse()
-        resp.message("pong")
-        return str(resp)
-    # quick path to test chat-only (skips RAG)
-    if user_text.strip().lower().startswith("!fast "):
-        query = user_text.split(" ", 1)[1]
-        reply_text = best_practice_answer(query)  # single chat call
-        resp = MessagingResponse(); resp.message(sanitize_plain(reply_text))
-        return str(resp)
-
     sender = (request.form.get("From") or "").strip()
 
-    # --- Show menu on first turn or when user types 'menu' ---
+    # ultra-fast exits
+    if user_text.lower() == "ping":
+        resp = MessagingResponse(); resp.message("pong"); return str(resp)
     choice = map_menu_choice_to_query(user_text)
-    if is_first_turn(sender) or choice == "__MENU__":
-        WELCOME_SEEN.add(sender)  # mark that the welcome has been shown
-        # optional: put a tiny marker in history to avoid empty-history edge cases
-        remember_turn(sender, "assistant", "(menu shown)")
-        resp = MessagingResponse()
-        resp.message(WELCOME_MENU)
-        return str(resp)
+    if choice == "__MENU__" or (is_first_turn(sender) and not user_text):
+        WELCOME_SEEN.add(sender); remember_turn(sender, "assistant", "(menu shown)")
+        resp = MessagingResponse(); resp.message(WELCOME_MENU); return str(resp)
+    if user_text.lower().startswith("!fast "):
+        query = user_text.split(" ", 1)[1]
+        txt = best_practice_answer(query)
+        resp = MessagingResponse(); resp.message(sanitize_plain(txt)); return str(resp)
 
-    # If user picked a number 1..7, replace their text with the mapped example
+    # normalize menu number selection
     if choice is not None and choice != "__MENU__":
         user_text = choice
 
-    # --- continue with your existing pipeline ---
     remember_turn(sender, "user", user_text)
-
-    # track turns for cadence
     SENDER_TURN_COUNT[sender] = SENDER_TURN_COUNT.get(sender, 0) + 1
 
-    if FAST_MODE:
-        # Skip extra OpenAI calls to avoid Twilio 15s timeout
-        profile = get_profile(sender)   # keep whatever we already know
-        summary = ""                    # skip summarize_history
+    elapsed = lambda: time.time() - t0
+    profile = get_profile(sender)
+    summary = CONV_SUMMARY.get(sender, "")
+
+    # A) short/generic → single chat
+    if looks_generic(user_text) or elapsed() > 0.5:
+        txt = best_practice_answer(user_text)
+        reply = sanitize_plain(txt)
+        remember_turn(sender, "assistant", reply)
+        _log_reply(sender, user_text, reply, from_pdf=False, confident=False)
+        _enqueue_deferred(sender, user_text)  # AFTER reply is decided
+        resp = MessagingResponse(); resp.message(reply); return str(resp)
+
+    # B) maybe-RAG → quick retrieval, then decide
+    confident = False; docs = []
+    if wants_rag(user_text) and elapsed() < TURN_BUDGET * 0.4:
+        try:
+            tR = time.time()
+            cache_key = (user_text, K)
+            if cache_key in _CHROMA_CACHE:
+                res = _CHROMA_CACHE[cache_key]
+            else:
+                res = collection.query(
+                    query_texts=[user_text],
+                    n_results=K,
+                    include=["documents", "distances"],
+                )
+                _CHROMA_CACHE[cache_key] = res
+            tr = time.time() - tR
+            dists = res.get("distances", [[]])[0]
+            docs = res.get("documents", [[]])[0]
+            top = dists[0] if dists else None
+            confident = (top is not None and top <= CONF_DIST) and (not docs or rough_keyword_match(user_text, docs[0]))
+            if tr > RETRIEVAL_BUDGET:
+                confident = False
+        except Exception as e:
+            print("retrieval error:", e)
+            confident = False
+            docs = []
+
+    # C) generate (one chat max)
+    if confident and docs and elapsed() < TURN_BUDGET * 0.7:
+        txt = rag_answer_from_posts(build_effective_query(user_text, profile, summary), docs)
+        if not txt or "not in the context" in (txt or "").lower():
+            txt = best_practice_answer(user_text)
+        reply = sanitize_plain(txt)
+        remember_turn(sender, "assistant", reply)
+        _log_reply(sender, user_text, reply, from_pdf=True, confident=True)
+        _enqueue_deferred(sender, user_text)
+        resp = MessagingResponse(); resp.message(reply); return str(resp)
     else:
-        # Only try profile extraction if message likely contains profile hints
-        if _looks_like_profile_update(user_text):
-            extract_profile_updates(sender, user_text)
-        # Skip summarization on first real user turn to save one model call,
-        # then summarize every 3rd user turn, or if summary is missing and we have >=2 turns.
-        if (SENDER_TURN_COUNT[sender] >= 2 and not CONV_SUMMARY.get(sender)) or (SENDER_TURN_COUNT[sender] % 3 == 0):
-            summary = summarize_history(sender)
-        else:
-            summary = CONV_SUMMARY.get(sender, "")
-        profile = get_profile(sender)
+        txt = best_practice_answer(user_text)
+        reply = sanitize_plain(txt)
+        remember_turn(sender, "assistant", reply)
+        _log_reply(sender, user_text, reply, from_pdf=False, confident=False)
+        _enqueue_deferred(sender, user_text)
+        resp = MessagingResponse(); resp.message(reply); return str(resp)
 
-    effective_query = build_effective_query(user_text, profile, summary)
-    # Compute a conservative time budget for the rest of the pipeline to stay within Twilio's ~15s
-    _req_elapsed = max(0.0, time.time() - t_start)
-    # Leave a cushion for Twilio and network jitter
-    remaining_budget = max(4.0, 12.0 - _req_elapsed)
-    answer, from_pdf, telemetry = answer_from_pdf_or_fallback(user_text, effective_query, time_budget=remaining_budget)
-
-    tail = ""
-    history = CONV_HISTORY.get(sender, [])
-    if not from_pdf and len(history) >= 2:
-        missing = []
-        if not profile.get("role"):  missing.append("target role")
-        if not profile.get("level"): missing.append("level")
-        if missing:
-            tail = f"\n\n(Optional: Share your {', '.join(missing)} to get more personalized answers.)"
-
-    reply_text = sanitize_plain(answer + tail)
-    remember_turn(sender, "assistant", reply_text)
-
-    # --- telemetry log ---
+def _log_reply(sender, question, reply_text, from_pdf, confident):
     log_interaction(sender, {
-    "question": user_text,
-    "effective_query": effective_query,
-    "from_pdf": telemetry.get("from_pdf"),
-    "confident": telemetry.get("confident"),
-    "top_distance": telemetry.get("top_distance"),
-    "distances": telemetry.get("distances"),
-    "answer_len": len(reply_text),
-})
+        "question": question,
+        "from_pdf": from_pdf,
+        "confident": confident,
+        "answer_len": len(reply_text),
+    })
 
-    resp = MessagingResponse()
-    resp.message(reply_text)
-    return str(resp)
+def _enqueue_deferred(sender: str, user_text: str):
+    try:
+        _DEFER_QUEUE.put_nowait((sender, user_text))
+    except Exception:
+        # If saturated, skip deferred work rather than affecting next turn latency
+        pass
 
 @app.route("/stats", methods=["GET"])
 def stats():
     token = request.args.get("token", "")
-    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         return "Unauthorized", 401
-
-    path = os.path.join(LOG_DIR, "interactions.jsonl")
+    path = LOG_FILE
     if not os.path.exists(path):
         return "No logs yet.", 200
-
     counts = {}
     total = 0
     try:
@@ -575,9 +468,7 @@ def stats():
                     total += 1
                 except Exception:
                     continue
-        # top 20
         top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:20]
-        # simple text response
         lines = [f"Total logged: {total}", "Top questions:"]
         for q, c in top:
             lines.append(f"{c:>3}  {q}")
@@ -585,9 +476,12 @@ def stats():
     except Exception as e:
         return f"Error reading logs: {e}", 500
 
-
 # -------------------- Run --------------------
-
 if __name__ == "__main__":
     print("✅ Flask is starting...")
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5001)), debug=True)
+    try:
+        count = collection.count() if hasattr(collection, "count") else "n/a"
+        print(f"Chroma collection '{COLLECTION}' count:", count)
+    except Exception as e:
+        print("Could not count Chroma docs:", e)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5001)), debug=DEBUG)
