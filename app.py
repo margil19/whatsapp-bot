@@ -358,6 +358,12 @@ def health():
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_reply():
     user_text = (request.form.get("Body") or "").strip()
+    # ultra-fast ping to confirm Twilio <-> Render path
+    if user_text.strip().lower() == "ping":
+        resp = MessagingResponse()
+        resp.message("pong")
+        return str(resp)
+
     sender = (request.form.get("From") or "").strip()
 
     # --- Show menu on first turn or when user types 'menu' ---
