@@ -3,6 +3,8 @@ import os
 import time
 import json
 import hashlib
+import threading
+import queue
 from datetime import datetime, timezone
 from math import sqrt
 from flask import Flask, request
@@ -12,11 +14,39 @@ import chromadb
 from chromadb.utils import embedding_functions
 from openai import OpenAI
 import re
+from functools import lru_cache
 
 # Prefer Render’s mount if available, else fallback to ./logs
 LOG_DIR = os.getenv("LOG_DIR", "./logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "interactions.jsonl")
+
+# Async logging setup to avoid blocking request path
+_LOG_QUEUE: TQueue[Tuple[str, Dict[str, Any]]] = Queue(maxsize=1000)
+def _log_writer():
+    while True:
+        try:
+            sender, payload = _LOG_QUEUE.get()
+            if sender is None:
+                continue
+            _ensure_log_dir()
+            path = os.path.join(LOG_DIR, "interactions.jsonl")
+            payload = dict(payload)
+            payload["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            payload["sender_masked"] = _mask_sender(sender)
+            payload.pop("sender", None)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print("log_writer error:", e)
+        finally:
+            try:
+                _LOG_QUEUE.task_done()
+            except Exception:
+                pass
+
+_log_thread = threading.Thread(target=_log_writer, daemon=True)
+_log_thread.start()
 
 
 def sanitize_plain(text: str) -> str:
@@ -43,18 +73,21 @@ def _mask_sender(sender: str) -> str:
 
 def log_interaction(sender: str, payload: dict):
     """Append one JSON line to logs/interactions.jsonl"""
-    _ensure_log_dir()
-    path = os.path.join(LOG_DIR, "interactions.jsonl")
     try:
-        payload = dict(payload)  # shallow copy
-        payload["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        payload["sender_masked"] = _mask_sender(sender)
-        # never store raw sender id
-        payload.pop("sender", None)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print("log_interaction error:", e)
+        _LOG_QUEUE.put_nowait((sender, payload))
+    except Exception:
+        # As a fallback, avoid dropping telemetry entirely
+        try:
+            _ensure_log_dir()
+            path = os.path.join(LOG_DIR, "interactions.jsonl")
+            payload = dict(payload)
+            payload["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            payload["sender_masked"] = _mask_sender(sender)
+            payload.pop("sender", None)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print("log_interaction error:", e)
 
 # -------------------- Flask --------------------
 app = Flask(__name__)
@@ -80,6 +113,10 @@ CONV_HISTORY = {}
 CONV_SUMMARY = {}
 # Track who has already seen the welcome menu
 WELCOME_SEEN = set()
+SENDER_TURN_COUNT = {}
+
+# Simple in-process caches to reduce repeated work
+_CHROMA_CACHE = {}
 
 
 # ---- Welcome menu / examples ----
@@ -220,6 +257,11 @@ def extract_profile_updates(sender: str, user_text: str) -> None:
         # tolerate parsing issues silently
         pass
 
+PROFILE_HINT_RE = re.compile(r"\b(role|position|title|senior|junior|mid|years|experience|exp|location|remote|hybrid|onsite|industry|domain|target|aiming|interested|looking)\b|https?://", re.I)
+
+def _looks_like_profile_update(text: str) -> bool:
+    return bool(PROFILE_HINT_RE.search(text or ""))
+
 # -------------------- Planner & answering --------------------
 def build_effective_query(user_msg: str, profile: dict, summary: str) -> str:
     parts = [user_msg]
@@ -229,6 +271,10 @@ def build_effective_query(user_msg: str, profile: dict, summary: str) -> str:
     if profile.get("location"): parts.append(f"Location: {profile['location']}")
     if summary: parts.append(f"Context: {summary}")
     return " | ".join(parts)
+
+@lru_cache(maxsize=256)
+def best_practice_answer_cached(query: str) -> str:
+    return best_practice_answer(query)
 
 def rag_answer_from_posts(question: str, docs: list[str]) -> str:
     context = "\n\n".join(docs)
@@ -262,18 +308,40 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
     """Retrieve from Chroma and answer; fall back to best-practice if low confidence or slow."""
     import time
 
+    # Hard time budget for RAG path (seconds). Fallback if exceeded.
+    TIME_BUDGET = float(os.getenv("RAG_TIME_BUDGET", "8.0"))
+
     # Use fewer neighbors in FAST_MODE to keep latency safely under Twilio's 15s
     k = 3 if FAST_MODE else K
 
     # 1) Retrieve with RAW user question
     t0 = time.time()
-    res = collection.query(
-        query_texts=[raw_question],
-        n_results=k,
-        include=["documents", "distances"],
-    )
+    cache_key = (raw_question, k)
+    if cache_key in _CHROMA_CACHE:
+        res = _CHROMA_CACHE[cache_key]
+    else:
+        res = collection.query(
+            query_texts=[raw_question],
+            n_results=k,
+            include=["documents", "distances"],
+        )
+        _CHROMA_CACHE[cache_key] = res
     t1 = time.time()
     print(f"[TIMING] chroma.query took {t1 - t0:.2f}s")
+
+    # If we've already blown the budget, answer fast
+    if (t1 - t0) > TIME_BUDGET * 0.6:
+        text = best_practice_answer_cached(raw_question)
+        telemetry = {
+            "from_pdf": False,
+            "confident": False,
+            "top_distance": None,
+            "distances": None,
+            "used_fallback": True,
+            "reason": "budget_after_retrieval"
+        }
+        print("[Fallback] Retrieval exceeded time budget; using best-practice.")
+        return text, False, telemetry
 
     docs  = res.get("documents", [[]])[0]
     dists = res.get("distances", [[]])[0]
@@ -288,7 +356,7 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
 
     # If nothing returned, go straight to best-practice
     if not docs or not dists:
-        text = best_practice_answer(raw_question)
+        text = best_practice_answer_cached(raw_question)
         telemetry = {
             "from_pdf": False,
             "confident": False,
@@ -307,7 +375,7 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
 
     # Optional extra guard: if we're far beyond threshold, bail early
     if not confident and top_distance is not None and top_distance > (CONF_THRESH + 0.10):
-        text = best_practice_answer(raw_question)
+        text = best_practice_answer_cached(raw_question)
         telemetry = {
             "from_pdf": False,
             "confident": False,
@@ -321,8 +389,14 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
     if confident:
         # 4) Generate from posts context
         t2 = time.time()
-        text = rag_answer_from_posts(effective_query, docs)
-        t3 = time.time()
+        # If we're close to the budget, skip RAG generation
+        if (t2 - t0) > TIME_BUDGET * 0.8:
+            text = best_practice_answer_cached(raw_question)
+            t3 = time.time()
+            print("[Fallback] Near budget before generation; using best-practice.")
+        else:
+            text = rag_answer_from_posts(effective_query, docs)
+            t3 = time.time()
         print(f"[TIMING] rag_answer_from_posts (chat) took {t3 - t2:.2f}s")
 
         # 5) Post-generation guard: if RAG says missing info, fall back
@@ -332,7 +406,7 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
             "context does not cover",
         ]):
             print("[RAG->Fallback] RAG reported missing info; using best-practice.")
-            text = best_practice_answer(raw_question)
+            text = best_practice_answer_cached(raw_question)
             telemetry = {
                 "from_pdf": False,
                 "confident": False,
@@ -354,7 +428,7 @@ def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
 
     # If not confident, use best-practice fallback
     print("[Fallback] Weak distance or keyword overlap; using best-practice.")
-    text = best_practice_answer(raw_question)
+    text = best_practice_answer_cached(raw_question)
     telemetry = {
         "from_pdf": False,
         "confident": False,
@@ -402,7 +476,6 @@ def whatsapp_reply():
     sender = (request.form.get("From") or "").strip()
 
     # --- Show menu on first turn or when user types 'menu' ---
-    # --- Show menu on first turn or when user types 'menu' ---
     choice = map_menu_choice_to_query(user_text)
     if is_first_turn(sender) or choice == "__MENU__":
         WELCOME_SEEN.add(sender)  # mark that the welcome has been shown
@@ -419,13 +492,22 @@ def whatsapp_reply():
     # --- continue with your existing pipeline ---
     remember_turn(sender, "user", user_text)
 
+    # track turns for cadence
+    SENDER_TURN_COUNT[sender] = SENDER_TURN_COUNT.get(sender, 0) + 1
+
     if FAST_MODE:
         # Skip extra OpenAI calls to avoid Twilio 15s timeout
         profile = get_profile(sender)   # keep whatever we already know
         summary = ""                    # skip summarize_history
     else:
-        extract_profile_updates(sender, user_text)
-        summary = summarize_history(sender)
+        # Only try profile extraction if message likely contains profile hints
+        if _looks_like_profile_update(user_text):
+            extract_profile_updates(sender, user_text)
+        # Summarize every 3rd user turn (or if not present yet) to cut latency
+        if not CONV_SUMMARY.get(sender) or (SENDER_TURN_COUNT[sender] % 3 == 0):
+            summary = summarize_history(sender)
+        else:
+            summary = CONV_SUMMARY.get(sender, "")
         profile = get_profile(sender)
 
     effective_query = build_effective_query(user_text, profile, summary)
@@ -498,4 +580,3 @@ def stats():
 if __name__ == "__main__":
     print("✅ Flask is starting...")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5001)), debug=True)
-
