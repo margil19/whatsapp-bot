@@ -1,0 +1,6 @@
+Flask==3.1.1
+twilio==9.7.1
+chromadb==1.0.20
+PyMuPDF==1.26.3
+openai==1.101.0
+gunicorn==21.2.0
