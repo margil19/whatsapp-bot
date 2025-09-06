@@ -147,7 +147,7 @@ if not os.environ.get("OPENAI_API_KEY"):
     raise RuntimeError("Set OPENAI_API_KEY environment variable before starting Flask.")
 
 # -------------------- Clients --------------------
-openai_client = OpenAI(timeout=8)
+openai_client = OpenAI(timeout=8, max_retries=1)
 
 # Chroma vector store
 chroma_client = chromadb.PersistentClient(path=DB_PATH)
@@ -166,11 +166,13 @@ except Exception as e:
     print("Could not count Chroma docs:", e)
 
 # -------------------- Safe wrapper --------------------
-def safe_chat_completion(model, messages, temperature=None):
+def safe_chat_completion(model, messages, temperature=None, max_tokens=None):
     kwargs = {"model": model, "messages": messages}
     # Only pass temperature if model supports it (o1-family requires default)
     if temperature is not None and not model.startswith("o1"):
         kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     return openai_client.chat.completions.create(**kwargs)
 
 # -------------------- Utilities --------------------
@@ -287,7 +289,8 @@ def rag_answer_from_posts(question: str, docs: list[str]) -> str:
     chat = safe_chat_completion(
         CHAT_MODEL,
         messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-        temperature=0.2
+        temperature=0.2,
+        max_tokens=220
     )
     return chat.choices[0].message.content.strip()
 
@@ -300,16 +303,18 @@ def best_practice_answer(query: str) -> str:
     chat = safe_chat_completion(
         CHAT_MODEL,
         messages=[{"role":"system","content":sys},{"role":"user","content":query}],
-        temperature=0.3
+        temperature=0.3,
+        max_tokens=220
     )
     return chat.choices[0].message.content.strip()
 
-def answer_from_pdf_or_fallback(raw_question: str, effective_query: str):
+def answer_from_pdf_or_fallback(raw_question: str, effective_query: str, time_budget: float | None = None):
     """Retrieve from Chroma and answer; fall back to best-practice if low confidence or slow."""
     import time
 
     # Hard time budget for RAG path (seconds). Fallback if exceeded.
-    TIME_BUDGET = float(os.getenv("RAG_TIME_BUDGET", "8.0"))
+    default_budget = float(os.getenv("RAG_TIME_BUDGET", "8.0"))
+    TIME_BUDGET = min(time_budget, default_budget) if time_budget else default_budget
 
     # Use fewer neighbors in FAST_MODE to keep latency safely under Twilio's 15s
     k = 3 if FAST_MODE else K
@@ -460,6 +465,7 @@ def health():
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_reply():
+    t_start = time.time()
     user_text = (request.form.get("Body") or "").strip()
     # ultra-fast ping to confirm Twilio <-> Render path
     if user_text.strip().lower() == "ping":
@@ -503,15 +509,20 @@ def whatsapp_reply():
         # Only try profile extraction if message likely contains profile hints
         if _looks_like_profile_update(user_text):
             extract_profile_updates(sender, user_text)
-        # Summarize every 3rd user turn (or if not present yet) to cut latency
-        if not CONV_SUMMARY.get(sender) or (SENDER_TURN_COUNT[sender] % 3 == 0):
+        # Skip summarization on first real user turn to save one model call,
+        # then summarize every 3rd user turn, or if summary is missing and we have >=2 turns.
+        if (SENDER_TURN_COUNT[sender] >= 2 and not CONV_SUMMARY.get(sender)) or (SENDER_TURN_COUNT[sender] % 3 == 0):
             summary = summarize_history(sender)
         else:
             summary = CONV_SUMMARY.get(sender, "")
         profile = get_profile(sender)
 
     effective_query = build_effective_query(user_text, profile, summary)
-    answer, from_pdf, telemetry = answer_from_pdf_or_fallback(user_text, effective_query)
+    # Compute a conservative time budget for the rest of the pipeline to stay within Twilio's ~15s
+    _req_elapsed = max(0.0, time.time() - t_start)
+    # Leave a cushion for Twilio and network jitter
+    remaining_budget = max(4.0, 12.0 - _req_elapsed)
+    answer, from_pdf, telemetry = answer_from_pdf_or_fallback(user_text, effective_query, time_budget=remaining_budget)
 
     tail = ""
     history = CONV_HISTORY.get(sender, [])
