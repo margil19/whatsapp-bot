@@ -13,7 +13,6 @@ import chromadb
 from chromadb.utils import embedding_functions
 from openai import OpenAI
 import re
-from functools import lru_cache
 
 # -------------------- Paths & logging --------------------
 LOG_DIR = os.getenv("LOG_DIR", "./logs")
@@ -71,29 +70,24 @@ def log_interaction(sender: str, payload: dict):
     except Exception:
         print("log_interaction: queue full; dropping log line.")
 
-# -------------------- Deferred worker (post-reply) --------------------
+# --- Defer only profile extraction (no summarization here) ---
 _DEFER_QUEUE: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=1000)
 
 def _defer_worker():
-    # Runs OUTSIDE the Twilio webhook response path
+    """Background worker: extract profile fields from messages without blocking the webhook."""
     while True:
         try:
             sender, user_text = _DEFER_QUEUE.get()
-            if not sender:
+            if not sender or not user_text:
                 continue
-            # Heuristics: only run one of these per deferred cycle
+
+            # Only run if the message looks like it contains profile info
             if _looks_like_profile_update(user_text):
                 try:
                     extract_profile_updates(sender, user_text)
                 except Exception as e:
                     print("defer extract_profile_updates error:", e)
-            else:
-                # Summarize every ~3 user turns if we have some history
-                if len(CONV_HISTORY.get(sender, [])) >= 3:
-                    try:
-                        summarize_history(sender)
-                    except Exception as e:
-                        print("defer summarize_history error:", e)
+
         except Exception as e:
             print("defer worker error:", e)
         finally:
@@ -102,7 +96,9 @@ def _defer_worker():
             except Exception:
                 pass
 
+# start the worker
 threading.Thread(target=_defer_worker, daemon=True).start()
+
 
 # -------------------- Flask --------------------
 app = Flask(__name__)
@@ -114,13 +110,18 @@ EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 DEBUG = os.getenv("DEBUG") == "1"
+LAST_MENU_AT = {}          # sender -> unix timestamp
+CHOICE_WINDOW = 120        # seconds
+RETRIEVAL_TIME_BUDGET = float(os.getenv("RETRIEVAL_TIME_BUDGET", "1.0"))  # seconds
 
 # Retrieval / budget tuning
-K = int(os.getenv("K", "3"))
-CONF_DIST = float(os.getenv("CONF_DIST", "0.35"))   # cosine distance; lower=closer
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "150"))
-RETRIEVAL_BUDGET = float(os.getenv("RETRIEVAL_BUDGET", "1.2"))
-TURN_BUDGET = float(os.getenv("TURN_BUDGET", "10.0"))  # leave ~5s headroom for network/Twilio
+K = int(os.getenv("K", "4"))
+CONF_DIST = float(os.getenv("CONF_DIST", "1.10"))   # tuned for your store; lower=closer
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "400"))
+RETRIEVAL_BUDGET = float(os.getenv("RETRIEVAL_BUDGET", "1.5"))      # token multiplier
+RETRIEVAL_TIME_BUDGET = float(os.getenv("RETRIEVAL_TIME_BUDGET", "1.0"))  # seconds
+TURN_BUDGET = float(os.getenv("TURN_BUDGET", "10.0"))
+
 
 # Clients
 if not os.environ.get("OPENAI_API_KEY"):
@@ -141,10 +142,12 @@ USER_PROFILE = {}
 CONV_HISTORY = {}
 CONV_SUMMARY = {}
 WELCOME_SEEN = set()
-SENDER_TURN_COUNT = {}
 _CHROMA_CACHE = {}
 
+
 # ---- Welcome menu / examples ----
+
+
 WELCOME_QUESTIONS = [
     "How can I make the most of LinkedIn filters to find opportunities?",
     "Give me 10 subject lines for cold outreach to a recruiter.",
@@ -157,15 +160,16 @@ WELCOME_QUESTIONS = [
 WELCOME_MENU = (
     "Hi! I can help with job search.\n"
     "Reply with a number or type your own question:\n\n"
-    "1) LinkedIn filters (find live opportunities)\n"
+    "1) LinkedIn filters\n"
     "2) Subject lines (recruiter outreach)\n"
     "3) Cold email structure\n"
     "4) Phases of a job search\n"
     "5) Referral ask\n"
     "6) STAR interview stories\n"
-    "7) Stay consistent / avoid burnout\n\n"
+    "7) Stay consistent\n\n"
     "Or type 'menu' anytime to see this again."
 )
+
 
 # -------------------- Helpers --------------------
 def safe_chat_completion(model, messages, temperature=None, max_tokens=None):
@@ -188,160 +192,299 @@ def get_profile(sender: str) -> dict:
     USER_PROFILE[sender] = prof
     return prof
 
-def cosine_sim(a, b) -> float:
-    dot = sum(x*y for x, y in zip(a, b))
-    na = sqrt(sum(x*x for x in a))
-    nb = sqrt(sum(y*y for y in b))
-    denom = na * nb
-    return dot / denom if denom > 1e-9 else 0.0
-
-def embed_text(text: str):
-    emb = openai_client.embeddings.create(model=EMBED_MODEL, input=text)
-    return emb.data[0].embedding
-
 def rough_keyword_match(q: str, doc: str, min_overlap: int = 2) -> bool:
     q_words = set(re.findall(r"[a-zA-Z]{4,}", (q or "").lower()))
     d_words = set(re.findall(r"[a-zA-Z]{4,}", (doc or "").lower()))
     return len(q_words & d_words) >= min_overlap
 
-def summarize_history(sender: str) -> str:
-    last = CONV_HISTORY.get(sender, [])
-    prior = CONV_SUMMARY.get(sender, "")
-    sys = (
-        "You maintain a 1–2 sentence running summary for a careers chat. "
-        "Capture the user's target role/level/industry/location, constraints, and current topic."
-    )
-    content = (
-        f"Prior summary:\n{prior}\n\n"
-        "Recent messages:\n" + "\n".join(f"{t['role']}: {t['text']}" for t in last[-4:]) +
-        "\n\nUpdate the summary in <= 40 words:"
-    )
+def summarize_history(sender: str, max_turns: int = 4, max_words: int = 40) -> str:
+    """
+    Produce a 1–2 sentence running summary of the conversation.
+    - Pulls only the last `max_turns` exchanges to keep the prompt tiny.
+    - Returns previous summary on any error (never blocks the reply).
+    - Keeps fields we care about: role, level, industry, location, constraints, current topic.
+    """
     try:
+        last = CONV_HISTORY.get(sender, [])[-max_turns:]
+        prior = CONV_SUMMARY.get(sender, "")
+
+        # Tiny prompt: compact, deterministic ask
+        sys = (
+            "You maintain a concise running summary (<= {mw} words) for a careers chat. "
+            "Capture: target role, level, industry, location, key constraints, and current topic. "
+            "Be factual, no fluff.".format(mw=max_words)
+        )
+        user = (
+            f"Prior summary:\n{prior}\n\n"
+            "Recent messages (role: text):\n" +
+            "\n".join(f"{t['role']}: {t['text']}" for t in last) +
+            f"\n\nUpdate the summary in <= {max_words} words."
+        )
+
         chat = safe_chat_completion(
             CHAT_MODEL,
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": content}],
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
             temperature=0.2
         )
-        new_summary = chat.choices[0].message.content.strip()
+        new_summary = (chat.choices[0].message.content or "").strip()
+
+        # Minimal sanitization & fallback
+        if not new_summary:
+            return prior
         CONV_SUMMARY[sender] = new_summary
+        if 'DEBUG' in globals() and DEBUG:
+            print("[summary]", new_summary)
         return new_summary
+
     except Exception as e:
-        print("summarize_history error:", e)
-        return prior or ""
+        # Never break the request path because of summary
+        if 'DEBUG' in globals() and DEBUG:
+            print("summarize_history error:", e)
+        return CONV_SUMMARY.get(sender, "")
+
+
+# Heuristic: only try to extract when text likely contains profile info
+PROFILE_HINT_RE = re.compile(
+    r"\b(role|title|position|level|senior|junior|intern|manager|lead|location|remote|onsite|"
+    r"city|country|years|experience|exp|industry|domain|goal|target|aim|looking for|"
+    r"switch|transition|linkedin|portfolio|resume|cv|github|url|http[s]?://)\b",
+    re.IGNORECASE,
+)
+
+def _looks_like_profile_update(text: str) -> bool:
+    return bool(text and PROFILE_HINT_RE.search(text))
 
 def extract_profile_updates(sender: str, user_text: str) -> None:
-    sys = (
-        "Extract a careers profile as strict JSON (no code block). "
-        "Allowed keys: role, level, location, years, industry, goals, links."
-    )
+    """
+    Pulls structured profile info from the user's message and merges it into USER_PROFILE[sender].
+    Keys: role, level, location, years, industry, goals, links.
+    - Skips OpenAI call unless the text looks relevant (cheap heuristic).
+    - Uses a tiny JSON-only prompt and tolerates bad JSON.
+    - Never raises; on any error, does nothing.
+    """
     try:
+        if not user_text or not _looks_like_profile_update(user_text):
+            return  # no-op if the message doesn't look like profile info
+
+        prof = get_profile(sender)
+
+        # --- Tiny, deterministic prompt (JSON only) ---
+        sys = (
+            "Extract a careers profile from the user's SINGLE message. "
+            "Return STRICT JSON ONLY (no code fences). "
+            "Allowed keys: role, level, location, years, industry, goals, links. "
+            "Rules:\n"
+            "- 'years' should be a number if stated (e.g., 3, 5.5), else omit.\n"
+            "- 'links' must be a list of URLs if present.\n"
+            "- Omit any key you cannot infer from THIS message alone."
+        )
+        user = f"User message:\n{user_text}\n\nReturn JSON only."
+
         chat = safe_chat_completion(
             CHAT_MODEL,
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user_text}]
+            messages=[{"role": "system", "content": sys},
+                      {"role": "user", "content": user}],
+            temperature=0.1
         )
-        prof = get_profile(sender)
-        try:
-            data = json.loads(chat.choices[0].message.content)
-            text_l = (user_text or "").lower()
-            for k, v in data.items():
-                if not v:
-                    continue
-                if k == "links" and isinstance(v, list):
-                    prof["links"] = list({*prof.get("links", []), *v})
-                elif k == "role":
-                    if any(t in text_l for t in ["role", "target", "position", "title", "aiming", "interested in"]):
-                        prof["role"] = v
-                else:
-                    prof[k] = v
-            USER_PROFILE[sender] = prof
-        except Exception:
-            pass
-    except Exception as e:
-        print("extract_profile_updates error:", e)
 
-PROFILE_HINT_RE = re.compile(
-    r"\b(role|position|title|senior|junior|mid|years|experience|exp|location|remote|hybrid|onsite|industry|domain|target|aiming|interested|looking)\b|https?://",
-    re.I
-)
-def _looks_like_profile_update(text: str) -> bool:
-    return bool(PROFILE_HINT_RE.search(text or ""))
+        raw = (chat.choices[0].message.content or "").strip()
+
+        # --- Parse JSON defensively ---
+        try:
+            data = json.loads(raw)
+        except Exception:
+            # lenient recovery: try to locate a JSON object in the text
+            m = re.search(r"\{.*\}", raw, flags=re.S)
+            data = json.loads(m.group(0)) if m else {}
+
+        if not isinstance(data, dict):
+            return
+
+        # --- Normalize & merge ---
+        def _clean_url(u: str) -> str | None:
+            if not isinstance(u, str):
+                return None
+            u = u.strip()
+            if not u:
+                return None
+            if not re.match(r"^https?://", u, flags=re.I):
+                # Accept bare domains for common cases
+                if re.match(r"^[\w.-]+\.[a-z]{2,}(/.*)?$", u, flags=re.I):
+                    u = "https://" + u
+                else:
+                    return None
+            return u
+
+        # Merge links (dedupe)
+        if "links" in data and isinstance(data["links"], list):
+            new_links = []
+            for u in data["links"]:
+                cu = _clean_url(u)
+                if cu:
+                    new_links.append(cu)
+            if new_links:
+                prof_links = set(prof.get("links", []) or [])
+                prof["links"] = list(prof_links.union(new_links))
+
+        # Merge scalar fields if present & non-empty
+        for key in ("role", "level", "location", "industry", "goals"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                prof[key] = val.strip()
+
+        # years → numeric if possible
+        yrs = data.get("years")
+        if isinstance(yrs, (int, float)):
+            prof["years"] = yrs
+        elif isinstance(yrs, str):
+            yrs_m = re.search(r"\d+(\.\d+)?", yrs)
+            if yrs_m:
+                try:
+                    prof["years"] = float(yrs_m.group(0))
+                except Exception:
+                    pass
+
+        USER_PROFILE[sender] = prof
+
+        if 'DEBUG' in globals() and DEBUG:
+            print("[profile]", json.dumps(prof, ensure_ascii=False))
+
+    except Exception as e:
+        if 'DEBUG' in globals() and DEBUG:
+            print("extract_profile_updates error:", e)
+        # swallow errors to avoid impacting the reply path
+        return
+
 
 def build_effective_query(user_msg: str, profile: dict, summary: str) -> str:
+    """Build a compact query string to send to retrieval/LLM."""
     parts = [user_msg]
-    if profile.get("role"): parts.append(f"Target role: {profile['role']}")
-    if profile.get("level"): parts.append(f"Level: {profile['level']}")
-    if profile.get("industry"): parts.append(f"Industry: {profile['industry']}")
-    if profile.get("location"): parts.append(f"Location: {profile['location']}")
-    if summary: parts.append(f"Context: {summary}")
+
+    # Only include the most impactful profile hints
+    if profile.get("role"):
+        parts.append(f"Target role: {profile['role']}")
+    if profile.get("industry"):
+        parts.append(f"Industry: {profile['industry']}")
+
+    # Keep summary short, only if it exists
+    if summary:
+        parts.append(f"Context: {summary}")
+
     return " | ".join(parts)
 
-@lru_cache(maxsize=256)
-def best_practice_answer_cached(query: str) -> str:
-    return best_practice_answer(query)
+# === helpers for compact, fast RAG ===
+AVG_TOKENS_PER_WORD = 1.3  # rough; fine for budgeting
+def clip_words(txt: str, max_words: int) -> str:
+    w = (txt or "").split()
+    return " ".join(w[:max_words])
+
+def _budgeted_context(docs: list[str]) -> str:
+    # Limit total context size based on RETRIEVAL_BUDGET × MAX_TOKENS
+    # Convert token budget to words to keep things model-agnostic.
+    total_token_budget = int(RETRIEVAL_BUDGET * MAX_TOKENS)
+    total_word_budget  = max(200, int(total_token_budget / AVG_TOKENS_PER_WORD))
+
+    # Per-chunk soft cap so one long chunk doesn’t hog the budget
+    per_chunk_cap = max(220, int(total_word_budget * 0.45))
+
+    kept, used = [], 0
+    for d in docs:
+        if used >= total_word_budget:
+            break
+        remain = total_word_budget - used
+        take = min(per_chunk_cap, remain)
+        piece = clip_words(d or "", take)
+        if piece.strip():
+            kept.append(piece)
+            used += len(piece.split())
+    return "\n\n".join(kept)
+
 
 def rag_answer_from_posts(question: str, docs: list[str]) -> str:
-    context = "\n\n".join(docs)
-    sys = (
-        "You are Margil Gandhi’s assistant. Answer ONLY using the context below. "
-        "If the answer isn't in the context, say you don't have that information. "
-        "Use plain text only."
-    )
-    user = f"Context:\n{context}\n\nQuestion: {question}"
+    """Answer ONLY from retrieved docs; compact, budgeted context; resilient to errors."""
     try:
+        context = _budgeted_context(docs)
+        sys = (
+            "You are Margil Gandhi’s assistant. Answer ONLY using the provided context. "
+            "If the answer is not present, explicitly say you don't have that information. "
+            f"Keep the answer concise (<= {MAX_TOKENS} tokens, ~{int(MAX_TOKENS/1.3)} words). "
+            "Plain text only."
+        )
+        user = f"Context:\n{context}\n\nQuestion: {question}"
         chat = safe_chat_completion(
             CHAT_MODEL,
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
-            temperature=0.2,
-            max_tokens=MAX_TOKENS
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+            temperature=0.2
         )
-        return chat.choices[0].message.content.strip()
+        text = (chat.choices[0].message.content or "").strip()
+        # Final safety: hard truncate by words to avoid overruns on WhatsApp
+        return clip_words(text, int(MAX_TOKENS / 1.3))
     except Exception as e:
-        print("rag_answer_from_posts error:", e)
-        return ""
+        if 'DEBUG' in globals() and DEBUG:
+            print("rag_answer_from_posts error:", e)
+        return "Sorry—I ran into an issue using the PDF context. Try asking again in a moment."
+
 
 def best_practice_answer(query: str) -> str:
-    sys = (
-        "You are a careers/job-search assistant. Provide a concise, practical answer. "
-        "Use plain text only. Keep it under 120 words. "
-        "Do not assume a specific role, level, or industry unless the user states it explicitly in THIS message."
-    )
+    """Fast, general fallback; short, practical; resilient to timeouts/errors."""
     try:
+        sys = (
+            "You are a careers/job-search assistant. Give a direct, practical answer. "
+            f"Keep it concise (<= {MAX_TOKENS} tokens, ~{int(MAX_TOKENS/1.3)} words). "
+            "No fluff, plain text."
+        )
         chat = safe_chat_completion(
             CHAT_MODEL,
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": query}],
-            temperature=0.3,
-            max_tokens=MAX_TOKENS
+            messages=[{"role":"system","content":sys},{"role":"user","content":query}],
+            temperature=0.3
         )
-        return chat.choices[0].message.content.strip()
+        text = (chat.choices[0].message.content or "").strip()
+        return clip_words(text, int(MAX_TOKENS / 1.3))
     except Exception as e:
-        print("best_practice_answer error:", e)
-        return "Here’s a quick take: clarify your goal, focus on what you can control this week, and take one small step today. Share role/level if you want a more tailored answer."
+        if 'DEBUG' in globals() and DEBUG:
+            print("best_practice_answer error:", e)
+        return "Sorry—I’m a bit busy right now. Please try again."
 
 # ---- heuristics to control expensive work ----
 def looks_generic(msg: str) -> bool:
     if not msg: return True
     m = msg.strip().lower()
-    if len(m) < 80: return True
+    # Loosen the short cutoff so we don't over-fallback
+    if len(m) < 50: 
+        return True
     return any(w in m for w in ["help", "tips", "advice", "how to start"]) and len(m) < 140
 
 def wants_rag(msg: str) -> bool:
     if not msg: return False
     m = msg.lower()
-    if len(m) >= 120: return True
-    return any(k in m for k in ["from my posts", "as i wrote", "from the pdf", "context above"])
+    # Long, specific asks likely benefit from RAG
+    if len(m) >= 120:
+        return True
+    # Explicit RAG cues
+    return any(k in m for k in [
+        "from my posts", "as i wrote", "from the pdf", "context above",
+        "according to your post", "based on your guide"
+    ])
 
 def is_first_turn(sender: str) -> bool:
     return sender not in WELCOME_SEEN
 
-def map_menu_choice_to_query(text: str) -> str | None:
+
+def map_menu_choice_to_query(text: str, sender: str | None = None) -> str | None:
     t = (text or "").strip().lower()
-    if t == "menu": return "__MENU__"
+    if t == "menu":
+        if sender:
+            LAST_MENU_AT[sender] = time.time()
+        return "__MENU__"
+
     m = re.match(r'^\s*(\d+)\s*\)?\s*$', t)
-    if m:
-        i = int(m.group(1)) - 1
-        if 0 <= i < len(WELCOME_QUESTIONS):
-            return WELCOME_QUESTIONS[i]
+    if m and sender:
+        if time.time() - LAST_MENU_AT.get(sender, 0) <= CHOICE_WINDOW:
+            i = int(m.group(1)) - 1
+            if 0 <= i < len(WELCOME_QUESTIONS):
+                return WELCOME_QUESTIONS[i]
     return None
+
 
 # -------------------- Routes --------------------
 @app.route("/", methods=["GET"])
@@ -357,33 +500,38 @@ def whatsapp_reply():
     # ultra-fast exits
     if user_text.lower() == "ping":
         resp = MessagingResponse(); resp.message("pong"); return str(resp)
-    choice = map_menu_choice_to_query(user_text)
+
+    # menu handling (now gated by recent menu window inside map_menu_choice_to_query)
+    choice = map_menu_choice_to_query(user_text, sender)
     if choice == "__MENU__" or (is_first_turn(sender) and not user_text):
-        WELCOME_SEEN.add(sender); remember_turn(sender, "assistant", "(menu shown)")
+        WELCOME_SEEN.add(sender)
+        LAST_MENU_AT[sender] = time.time()   # record menu show time
+        remember_turn(sender, "assistant", "(menu shown)")
         resp = MessagingResponse(); resp.message(WELCOME_MENU); return str(resp)
+
+    # quick dev command that bypasses RAG
     if user_text.lower().startswith("!fast "):
         query = user_text.split(" ", 1)[1]
         txt = best_practice_answer(query)
         resp = MessagingResponse(); resp.message(sanitize_plain(txt)); return str(resp)
 
-    # normalize menu number selection
+    # normalize menu number selection (only valid shortly after menu)
     if choice is not None and choice != "__MENU__":
         user_text = choice
 
     remember_turn(sender, "user", user_text)
-    SENDER_TURN_COUNT[sender] = SENDER_TURN_COUNT.get(sender, 0) + 1
 
     elapsed = lambda: time.time() - t0
+    summary = summarize_history(sender)
     profile = get_profile(sender)
-    summary = CONV_SUMMARY.get(sender, "")
 
-    # A) short/generic → single chat
+    # A) short/generic → single quick chat
     if looks_generic(user_text) or elapsed() > 0.5:
         txt = best_practice_answer(user_text)
         reply = sanitize_plain(txt)
         remember_turn(sender, "assistant", reply)
         _log_reply(sender, user_text, reply, from_pdf=False, confident=False)
-        _enqueue_deferred(sender, user_text)  # AFTER reply is decided
+        _enqueue_deferred(sender, user_text)  # defer profile extraction only
         resp = MessagingResponse(); resp.message(reply); return str(resp)
 
     # B) maybe-RAG → quick retrieval, then decide
@@ -402,11 +550,21 @@ def whatsapp_reply():
                 )
                 _CHROMA_CACHE[cache_key] = res
             tr = time.time() - tR
+
             dists = res.get("distances", [[]])[0]
-            docs = res.get("documents", [[]])[0]
-            top = dists[0] if dists else None
-            confident = (top is not None and top <= CONF_DIST) and (not docs or rough_keyword_match(user_text, docs[0]))
-            if tr > RETRIEVAL_BUDGET:
+            docs  = res.get("documents", [[]])[0]
+            top   = dists[0] if dists else None
+
+            # require: good distance, have docs, and keyword overlap
+            confident = (
+                top is not None and
+                top <= CONF_DIST and
+                bool(docs) and
+                rough_keyword_match(user_text, docs[0])
+            )
+
+            # if retrieval took too long, skip RAG to protect time budget
+            if tr > RETRIEVAL_TIME_BUDGET:
                 confident = False
         except Exception as e:
             print("retrieval error:", e)
@@ -414,8 +572,10 @@ def whatsapp_reply():
             docs = []
 
     # C) generate (one chat max)
+    eq = build_effective_query(user_text, profile, summary)
+
     if confident and docs and elapsed() < TURN_BUDGET * 0.7:
-        txt = rag_answer_from_posts(build_effective_query(user_text, profile, summary), docs)
+        txt = rag_answer_from_posts(eq, docs)
         if not txt or "not in the context" in (txt or "").lower():
             txt = best_practice_answer(user_text)
         reply = sanitize_plain(txt)
@@ -445,6 +605,7 @@ def _enqueue_deferred(sender: str, user_text: str):
     except Exception:
         # If saturated, skip deferred work rather than affecting next turn latency
         pass
+
 
 @app.route("/stats", methods=["GET"])
 def stats():

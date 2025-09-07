@@ -7,8 +7,8 @@ DB_PATH     = os.getenv("DB_PATH", "./db")
 COLLECTION  = "linkedin_posts"
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # must match app.py
 SCHEMA_VER  = "v1"
-CHUNK_SIZE  = 650
-OVERLAP     = 130
+CHUNK_SIZE  = 320
+OVERLAP     = 64
 
 def load_pdf_text(path: str) -> str:
     doc = fitz.open(path)
