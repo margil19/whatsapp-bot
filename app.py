@@ -5,16 +5,15 @@ import hashlib
 import threading
 import queue
 from datetime import datetime, timezone
-from math import sqrt
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-
+from collections import OrderedDict
 import chromadb
 from chromadb.utils import embedding_functions
 from openai import OpenAI
 import re
 
-# -------------------- Paths & logging --------------------
+# ==================== Paths & logging ====================
 LOG_DIR = os.getenv("LOG_DIR", "./logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "interactions.jsonl")
@@ -38,6 +37,16 @@ def sanitize_plain(text: str) -> str:
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
 
+def _open_log_file():
+    # Simple size-based rollover at 10MB
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 10 * 1024 * 1024:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            os.replace(LOG_FILE, f"{LOG_FILE}.{ts}")
+    except Exception:
+        pass
+    return open(LOG_FILE, "a", encoding="utf-8")
+
 # Async logging (non-blocking)
 _LOG_QUEUE: "queue.Queue[tuple[str, dict]]" = queue.Queue(maxsize=1000)
 
@@ -52,7 +61,7 @@ def _log_writer():
             payload["ts"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             payload["sender_masked"] = _mask_sender(sender)
             payload.pop("sender", None)
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
+            with _open_log_file() as f:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception as e:
             print("log_writer error:", e)
@@ -61,7 +70,6 @@ def _log_writer():
                 _LOG_QUEUE.task_done()
             except Exception:
                 pass
-
 threading.Thread(target=_log_writer, daemon=True).start()
 
 def log_interaction(sender: str, payload: dict):
@@ -96,14 +104,13 @@ def _defer_worker():
             except Exception:
                 pass
 
-# start the worker
 threading.Thread(target=_defer_worker, daemon=True).start()
 
 
-# -------------------- Flask --------------------
+# ==================== Flask ====================
 app = Flask(__name__)
 
-# -------------------- Config --------------------
+# ==================== Config ====================
 DB_PATH = os.getenv("DB_PATH", "./db")
 COLLECTION = "linkedin_posts"
 EMBED_MODEL = "text-embedding-3-small"
@@ -111,22 +118,21 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 DEBUG = os.getenv("DEBUG") == "1"
 LAST_MENU_AT = {}          # sender -> unix timestamp
-CHOICE_WINDOW = 120        # seconds
-RETRIEVAL_TIME_BUDGET = float(os.getenv("RETRIEVAL_TIME_BUDGET", "1.0"))  # seconds
+CHOICE_WINDOW = 60        # seconds
 
 # Retrieval / budget tuning
 K = int(os.getenv("K", "4"))
-CONF_DIST = float(os.getenv("CONF_DIST", "1.10"))   # tuned for your store; lower=closer
+CONF_DIST = float(os.getenv("CONF_DIST", "1.10"))   # tuned for cosine distance; confirm metric
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "400"))
 RETRIEVAL_BUDGET = float(os.getenv("RETRIEVAL_BUDGET", "1.5"))      # token multiplier
 RETRIEVAL_TIME_BUDGET = float(os.getenv("RETRIEVAL_TIME_BUDGET", "1.0"))  # seconds
 TURN_BUDGET = float(os.getenv("TURN_BUDGET", "10.0"))
 
-
-# Clients
+# ==================== Clients ====================
 if not os.environ.get("OPENAI_API_KEY"):
     raise RuntimeError("Set OPENAI_API_KEY before starting Flask.")
-openai_client = OpenAI(timeout=5, max_retries=0)
+# Slightly softer client on transient issues
+openai_client = OpenAI(timeout=8, max_retries=2)
 
 chroma_client = chromadb.PersistentClient(path=DB_PATH)
 openai_ef = embedding_functions.OpenAIEmbeddingFunction(
@@ -136,18 +142,69 @@ collection = chroma_client.get_or_create_collection(
     name=COLLECTION, embedding_function=openai_ef
 )
 
-# Stores
+# ==================== Bounded in-memory stores ====================
 MAX_HISTORY = 10
-USER_PROFILE = {}
-CONV_HISTORY = {}
-CONV_SUMMARY = {}
+
+class SenderMap(dict):
+    """LRU-ish per-sender container to avoid unbounded growth."""
+    def __init__(self, max_senders=5000):
+        super().__init__()
+        self.order = OrderedDict()
+        self.max_senders = max_senders
+        self.lock = threading.Lock()
+
+    def touch(self, sender):
+        with self.lock:
+            self.order.pop(sender, None)
+            self.order[sender] = True
+            if len(self.order) > self.max_senders:
+                old, _ = self.order.popitem(last=False)
+                self.pop(old, None)
+
+CONV_HISTORY = SenderMap()
+CONV_SUMMARY = SenderMap()
+USER_PROFILE = SenderMap()
 WELCOME_SEEN = set()
-_CHROMA_CACHE = {}
 
+def remember_turn(sender: str, role: str, text: str) -> None:
+    hist = CONV_HISTORY.get(sender) or []
+    hist.append({"role": role, "text": text})
+    CONV_HISTORY[sender] = hist[-MAX_HISTORY:]
+    CONV_HISTORY.touch(sender)
 
-# ---- Welcome menu / examples ----
+def get_profile(sender: str) -> dict:
+    prof = USER_PROFILE.get(sender) or {
+        "role": None, "level": None, "location": None,
+        "years": None, "industry": None, "goals": None,
+        "links": [], "prefs": {}
+    }
+    USER_PROFILE[sender] = prof
+    USER_PROFILE.touch(sender)
+    return prof
 
+# Bounded, thread-safe LRU cache for retrieval results
+_cache_lock = threading.Lock()
+class LRUCache(OrderedDict):
+    def __init__(self, maxsize=256):
+        super().__init__()
+        self.maxsize = maxsize
+    def get_set(self, key, compute_fn):
+        with _cache_lock:
+            if key in self:
+                self.move_to_end(key)
+                return self[key]
+        # compute outside lock to avoid blocking others
+        value = compute_fn()
+        with _cache_lock:
+            self[key] = value
+            self.move_to_end(key)
+            if len(self) > self.maxsize:
+                self.popitem(last=False)
+        return value
 
+_CHROMA_CACHE = LRUCache(maxsize=int(os.getenv("CHROMA_CACHE_SIZE", "256")))
+
+# ==================== Welcome menu / examples ====================
 WELCOME_QUESTIONS = [
     "How can I make the most of LinkedIn filters to find opportunities?",
     "Give me 10 subject lines for cold outreach to a recruiter.",
@@ -167,30 +224,15 @@ WELCOME_MENU = (
     "5) Referral ask\n"
     "6) STAR interview stories\n"
     "7) Stay consistent\n\n"
-    "Or type 'menu' anytime to see this again."
+    "Tips: type 'menu' anytime to see this again, or '!fast <question>' for a quick reply."
 )
 
-
-# -------------------- Helpers --------------------
+# ==================== Helpers ====================
 def safe_chat_completion(model, messages, temperature=None, max_tokens=None):
     kwargs = {"model": model, "messages": messages, "max_tokens": max_tokens or MAX_TOKENS}
     if temperature is not None and not model.startswith("o1"):
         kwargs["temperature"] = temperature
     return openai_client.chat.completions.create(**kwargs)
-
-def remember_turn(sender: str, role: str, text: str) -> None:
-    hist = CONV_HISTORY.get(sender) or []
-    hist.append({"role": role, "text": text})
-    CONV_HISTORY[sender] = hist[-MAX_HISTORY:]
-
-def get_profile(sender: str) -> dict:
-    prof = USER_PROFILE.get(sender) or {
-        "role": None, "level": None, "location": None,
-        "years": None, "industry": None, "goals": None,
-        "links": [], "prefs": {}
-    }
-    USER_PROFILE[sender] = prof
-    return prof
 
 def rough_keyword_match(q: str, doc: str, min_overlap: int = 2) -> bool:
     q_words = set(re.findall(r"[a-zA-Z]{4,}", (q or "").lower()))
@@ -202,13 +244,11 @@ def summarize_history(sender: str, max_turns: int = 4, max_words: int = 40) -> s
     Produce a 1–2 sentence running summary of the conversation.
     - Pulls only the last `max_turns` exchanges to keep the prompt tiny.
     - Returns previous summary on any error (never blocks the reply).
-    - Keeps fields we care about: role, level, industry, location, constraints, current topic.
     """
     try:
         last = CONV_HISTORY.get(sender, [])[-max_turns:]
         prior = CONV_SUMMARY.get(sender, "")
 
-        # Tiny prompt: compact, deterministic ask
         sys = (
             "You maintain a concise running summary (<= {mw} words) for a careers chat. "
             "Capture: target role, level, industry, location, key constraints, and current topic. "
@@ -227,30 +267,25 @@ def summarize_history(sender: str, max_turns: int = 4, max_words: int = 40) -> s
             temperature=0.2
         )
         new_summary = (chat.choices[0].message.content or "").strip()
-
-        # Minimal sanitization & fallback
         if not new_summary:
             return prior
         CONV_SUMMARY[sender] = new_summary
-        if 'DEBUG' in globals() and DEBUG:
+        CONV_SUMMARY.touch(sender)
+        if DEBUG:
             print("[summary]", new_summary)
         return new_summary
 
     except Exception as e:
-        # Never break the request path because of summary
-        if 'DEBUG' in globals() and DEBUG:
+        if DEBUG:
             print("summarize_history error:", e)
         return CONV_SUMMARY.get(sender, "")
 
-
-# Heuristic: only try to extract when text likely contains profile info
 PROFILE_HINT_RE = re.compile(
     r"\b(role|title|position|level|senior|junior|intern|manager|lead|location|remote|onsite|"
     r"city|country|years|experience|exp|industry|domain|goal|target|aim|looking for|"
     r"switch|transition|linkedin|portfolio|resume|cv|github|url|http[s]?://)\b",
     re.IGNORECASE,
 )
-
 def _looks_like_profile_update(text: str) -> bool:
     return bool(text and PROFILE_HINT_RE.search(text))
 
@@ -264,11 +299,10 @@ def extract_profile_updates(sender: str, user_text: str) -> None:
     """
     try:
         if not user_text or not _looks_like_profile_update(user_text):
-            return  # no-op if the message doesn't look like profile info
+            return
 
         prof = get_profile(sender)
 
-        # --- Tiny, deterministic prompt (JSON only) ---
         sys = (
             "Extract a careers profile from the user's SINGLE message. "
             "Return STRICT JSON ONLY (no code fences). "
@@ -293,14 +327,12 @@ def extract_profile_updates(sender: str, user_text: str) -> None:
         try:
             data = json.loads(raw)
         except Exception:
-            # lenient recovery: try to locate a JSON object in the text
             m = re.search(r"\{.*\}", raw, flags=re.S)
             data = json.loads(m.group(0)) if m else {}
 
         if not isinstance(data, dict):
             return
 
-        # --- Normalize & merge ---
         def _clean_url(u: str) -> str | None:
             if not isinstance(u, str):
                 return None
@@ -308,7 +340,6 @@ def extract_profile_updates(sender: str, user_text: str) -> None:
             if not u:
                 return None
             if not re.match(r"^https?://", u, flags=re.I):
-                # Accept bare domains for common cases
                 if re.match(r"^[\w.-]+\.[a-z]{2,}(/.*)?$", u, flags=re.I):
                     u = "https://" + u
                 else:
@@ -345,31 +376,24 @@ def extract_profile_updates(sender: str, user_text: str) -> None:
                     pass
 
         USER_PROFILE[sender] = prof
+        USER_PROFILE.touch(sender)
 
-        if 'DEBUG' in globals() and DEBUG:
+        if DEBUG:
             print("[profile]", json.dumps(prof, ensure_ascii=False))
 
     except Exception as e:
-        if 'DEBUG' in globals() and DEBUG:
+        if DEBUG:
             print("extract_profile_updates error:", e)
-        # swallow errors to avoid impacting the reply path
         return
 
-
 def build_effective_query(user_msg: str, profile: dict, summary: str) -> str:
-    """Build a compact query string to send to retrieval/LLM."""
     parts = [user_msg]
-
-    # Only include the most impactful profile hints
     if profile.get("role"):
         parts.append(f"Target role: {profile['role']}")
     if profile.get("industry"):
         parts.append(f"Industry: {profile['industry']}")
-
-    # Keep summary short, only if it exists
     if summary:
         parts.append(f"Context: {summary}")
-
     return " | ".join(parts)
 
 # === helpers for compact, fast RAG ===
@@ -379,12 +403,8 @@ def clip_words(txt: str, max_words: int) -> str:
     return " ".join(w[:max_words])
 
 def _budgeted_context(docs: list[str]) -> str:
-    # Limit total context size based on RETRIEVAL_BUDGET × MAX_TOKENS
-    # Convert token budget to words to keep things model-agnostic.
     total_token_budget = int(RETRIEVAL_BUDGET * MAX_TOKENS)
     total_word_budget  = max(200, int(total_token_budget / AVG_TOKENS_PER_WORD))
-
-    # Per-chunk soft cap so one long chunk doesn’t hog the budget
     per_chunk_cap = max(220, int(total_word_budget * 0.45))
 
     kept, used = [], 0
@@ -399,15 +419,13 @@ def _budgeted_context(docs: list[str]) -> str:
             used += len(piece.split())
     return "\n\n".join(kept)
 
-
 def rag_answer_from_posts(question: str, docs: list[str]) -> str:
-    """Answer ONLY from retrieved docs; compact, budgeted context; resilient to errors."""
+    """Answer ONLY from retrieved docs; compact context; resilient to errors."""
     try:
         context = _budgeted_context(docs)
         sys = (
-            "You are Margil Gandhi’s assistant. Answer ONLY using the provided context. "
-            "If the answer is not present, explicitly say you don't have that information. "
-            f"Keep the answer concise (<= {MAX_TOKENS} tokens, ~{int(MAX_TOKENS/1.3)} words). "
+            "You are Margil Gandhi’s assistant. Answer ONLY from the provided context. "
+            "Be direct and concise. If listing multiple points, use a numbered list—one item per line. "
             "Plain text only."
         )
         user = f"Context:\n{context}\n\nQuestion: {question}"
@@ -417,22 +435,21 @@ def rag_answer_from_posts(question: str, docs: list[str]) -> str:
             temperature=0.2
         )
         text = (chat.choices[0].message.content or "").strip()
-        # Final safety: hard truncate by words to avoid overruns on WhatsApp
         return clip_words(text, int(MAX_TOKENS / 1.3))
     except Exception as e:
-        if 'DEBUG' in globals() and DEBUG:
+        if DEBUG:
             print("rag_answer_from_posts error:", e)
         return "Sorry—I ran into an issue using the PDF context. Try asking again in a moment."
-
 
 def best_practice_answer(query: str) -> str:
     """Fast, general fallback; short, practical; resilient to timeouts/errors."""
     try:
         sys = (
-            "You are a careers/job-search assistant. Give a direct, practical answer. "
-            f"Keep it concise (<= {MAX_TOKENS} tokens, ~{int(MAX_TOKENS/1.3)} words). "
-            "No fluff, plain text."
+            "You are a careers/job-search assistant. Be direct and concise. "
+            "If listing multiple points, output a numbered list with ONE item per line. "
+            "Plain text only; no markdown or preamble."
         )
+
         chat = safe_chat_completion(
             CHAT_MODEL,
             messages=[{"role":"system","content":sys},{"role":"user","content":query}],
@@ -441,26 +458,25 @@ def best_practice_answer(query: str) -> str:
         text = (chat.choices[0].message.content or "").strip()
         return clip_words(text, int(MAX_TOKENS / 1.3))
     except Exception as e:
-        if 'DEBUG' in globals() and DEBUG:
+        if DEBUG:
             print("best_practice_answer error:", e)
         return "Sorry—I’m a bit busy right now. Please try again."
 
 # ---- heuristics to control expensive work ----
 def looks_generic(msg: str) -> bool:
-    if not msg: return True
+    if not msg: 
+        return True
     m = msg.strip().lower()
-    # Loosen the short cutoff so we don't over-fallback
-    if len(m) < 50: 
+    if len(m) < 50:
         return True
     return any(w in m for w in ["help", "tips", "advice", "how to start"]) and len(m) < 140
 
 def wants_rag(msg: str) -> bool:
-    if not msg: return False
+    if not msg: 
+        return False
     m = msg.lower()
-    # Long, specific asks likely benefit from RAG
     if len(m) >= 120:
         return True
-    # Explicit RAG cues
     return any(k in m for k in [
         "from my posts", "as i wrote", "from the pdf", "context above",
         "according to your post", "based on your guide"
@@ -469,10 +485,9 @@ def wants_rag(msg: str) -> bool:
 def is_first_turn(sender: str) -> bool:
     return sender not in WELCOME_SEEN
 
-
 def map_menu_choice_to_query(text: str, sender: str | None = None) -> str | None:
     t = (text or "").strip().lower()
-    if t == "menu":
+    if t in ("menu", "help", "?"):
         if sender:
             LAST_MENU_AT[sender] = time.time()
         return "__MENU__"
@@ -485,8 +500,33 @@ def map_menu_choice_to_query(text: str, sender: str | None = None) -> str | None
                 return WELCOME_QUESTIONS[i]
     return None
 
+def _enqueue_deferred(sender: str, user_text: str):
+    try:
+        _DEFER_QUEUE.put_nowait((sender, user_text))
+    except Exception:
+        # If saturated, skip deferred work rather than affecting next turn latency
+        pass
 
-# -------------------- Routes --------------------
+def _log_reply(sender, question, reply_text, from_pdf, confident):
+    log_interaction(sender, {
+        "question": question,
+        "from_pdf": from_pdf,
+        "confident": confident,
+        "answer_len": len(reply_text),
+    })
+
+# ==================== Retrieval with cache ====================
+def _query_chroma_cached(q_texts, n_results):
+    def _compute():
+        return collection.query(
+            query_texts=q_texts,
+            n_results=n_results,
+            include=["documents", "distances"],
+        )
+    key = (tuple(q_texts), n_results)
+    return _CHROMA_CACHE.get_set(key, _compute)
+
+# ==================== Routes ====================
 @app.route("/", methods=["GET"])
 def health():
     return "OK"
@@ -497,36 +537,38 @@ def whatsapp_reply():
     user_text = (request.form.get("Body") or "").strip()
     sender = (request.form.get("From") or "").strip()
 
-    # ultra-fast exits
+    # Ultra-fast exits
     if user_text.lower() == "ping":
         resp = MessagingResponse(); resp.message("pong"); return str(resp)
 
-    # menu handling (now gated by recent menu window inside map_menu_choice_to_query)
+    # Menu/help handling (within window logic)
     choice = map_menu_choice_to_query(user_text, sender)
     if choice == "__MENU__" or (is_first_turn(sender) and not user_text):
         WELCOME_SEEN.add(sender)
-        LAST_MENU_AT[sender] = time.time()   # record menu show time
+        LAST_MENU_AT[sender] = time.time()
         remember_turn(sender, "assistant", "(menu shown)")
         resp = MessagingResponse(); resp.message(WELCOME_MENU); return str(resp)
 
-    # quick dev command that bypasses RAG
+    # Quick dev command that bypasses RAG
     if user_text.lower().startswith("!fast "):
         query = user_text.split(" ", 1)[1]
         txt = best_practice_answer(query)
         resp = MessagingResponse(); resp.message(sanitize_plain(txt)); return str(resp)
 
-    # normalize menu number selection (only valid shortly after menu)
-    if choice is not None and choice != "__MENU__":
-        user_text = choice
+    # Normalize menu number selection (only valid shortly after menu)
+    mapped = map_menu_choice_to_query(user_text, sender)
+    if mapped is not None and mapped != "__MENU__":
+        user_text = mapped
 
+    # --- ALWAYS record user turn + refresh summary inline (keep memory fresh) ---
     remember_turn(sender, "user", user_text)
+    try:
+        _ = summarize_history(sender)  # tiny prompt; ignore errors to keep path fast
+    except Exception:
+        pass
 
-    elapsed = lambda: time.time() - t0
-    summary = summarize_history(sender)
-    profile = get_profile(sender)
-
-    # A) short/generic → single quick chat
-    if looks_generic(user_text) or elapsed() > 0.5:
+    # EARLY EXIT BEFORE ANY LLM HEAVY WORK
+    if looks_generic(user_text):
         txt = best_practice_answer(user_text)
         reply = sanitize_plain(txt)
         remember_turn(sender, "assistant", reply)
@@ -534,21 +576,16 @@ def whatsapp_reply():
         _enqueue_deferred(sender, user_text)  # defer profile extraction only
         resp = MessagingResponse(); resp.message(reply); return str(resp)
 
+    # From here on, we can afford a bit more work
+    elapsed = lambda: time.time() - t0
+
+
     # B) maybe-RAG → quick retrieval, then decide
     confident = False; docs = []
     if wants_rag(user_text) and elapsed() < TURN_BUDGET * 0.4:
         try:
             tR = time.time()
-            cache_key = (user_text, K)
-            if cache_key in _CHROMA_CACHE:
-                res = _CHROMA_CACHE[cache_key]
-            else:
-                res = collection.query(
-                    query_texts=[user_text],
-                    n_results=K,
-                    include=["documents", "distances"],
-                )
-                _CHROMA_CACHE[cache_key] = res
+            res = _query_chroma_cached([user_text], K)
             tr = time.time() - tR
 
             dists = res.get("distances", [[]])[0]
@@ -563,13 +600,23 @@ def whatsapp_reply():
                 rough_keyword_match(user_text, docs[0])
             )
 
-            # if retrieval took too long, skip RAG to protect time budget
             if tr > RETRIEVAL_TIME_BUDGET:
                 confident = False
         except Exception as e:
             print("retrieval error:", e)
             confident = False
             docs = []
+
+    # Prepare profile+summary only if we proceed to generation
+    summary = ""
+    profile = {}
+    if elapsed() < TURN_BUDGET * 0.6:
+        try:
+            summary = summarize_history(sender)
+            profile = get_profile(sender)
+        except Exception as e:
+            if DEBUG:
+                print("prep context error:", e)
 
     # C) generate (one chat max)
     eq = build_effective_query(user_text, profile, summary)
@@ -591,26 +638,12 @@ def whatsapp_reply():
         _enqueue_deferred(sender, user_text)
         resp = MessagingResponse(); resp.message(reply); return str(resp)
 
-def _log_reply(sender, question, reply_text, from_pdf, confident):
-    log_interaction(sender, {
-        "question": question,
-        "from_pdf": from_pdf,
-        "confident": confident,
-        "answer_len": len(reply_text),
-    })
-
-def _enqueue_deferred(sender: str, user_text: str):
-    try:
-        _DEFER_QUEUE.put_nowait((sender, user_text))
-    except Exception:
-        # If saturated, skip deferred work rather than affecting next turn latency
-        pass
-
-
 @app.route("/stats", methods=["GET"])
 def stats():
     token = request.args.get("token", "")
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+    if not ADMIN_TOKEN:
+        return "Admin token not configured.", 400
+    if token != ADMIN_TOKEN:
         return "Unauthorized", 401
     path = LOG_FILE
     if not os.path.exists(path):
@@ -637,12 +670,15 @@ def stats():
     except Exception as e:
         return f"Error reading logs: {e}", 500
 
-# -------------------- Run --------------------
+# ==================== Run ====================
 if __name__ == "__main__":
     print("✅ Flask is starting...")
     try:
         count = collection.count() if hasattr(collection, "count") else "n/a"
         print(f"Chroma collection '{COLLECTION}' count:", count)
+        if DEBUG:
+            # Quick note to validate distance semantics empirically if needed
+            print("Note: CONF_DIST assumes cosine distance (smaller is better).")
     except Exception as e:
         print("Could not count Chroma docs:", e)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5001)), debug=DEBUG)

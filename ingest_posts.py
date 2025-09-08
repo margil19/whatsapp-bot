@@ -1,8 +1,9 @@
 # ingest_posts.py
-import os, glob, fitz, chromadb
+import os, glob, json, hashlib, fitz, chromadb
 from chromadb.utils import embedding_functions
 
 DATA_DIR    = "data"                         # PDFs folder
+STATE_PATH  = os.path.join(DATA_DIR, ".ingest_state.json")
 DB_PATH     = os.getenv("DB_PATH", "./db")
 COLLECTION  = "linkedin_posts"
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # must match app.py
@@ -10,11 +11,37 @@ SCHEMA_VER  = "v1"
 CHUNK_SIZE  = 320
 OVERLAP     = 64
 
+def _read_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _write_state(state: dict):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+def _sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+def _sanitize_text(t: str) -> str:
+    # Light cleanup to stabilize hashing and chunking
+    import re
+    t = re.sub(r'[\u200b-\u200d\uFEFF]', '', t)      # zero-widths
+    t = re.sub(r'[ \t]+', ' ', t)                    # collapse spaces
+    t = re.sub(r'\s+\n', '\n', t)                    # trim line tails
+    t = re.sub(r'\n{3,}', '\n\n', t)                 # limit blank lines
+    return t.strip()
+
 def load_pdf_text(path: str) -> str:
     doc = fitz.open(path)
     parts = [page.get_text("text").strip() for page in doc]
     doc.close()
-    return "\n\n".join(parts)
+    return _sanitize_text("\n\n".join(parts))
 
 def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=OVERLAP):
     words, chunks, i = text.split(), [], 0
@@ -34,20 +61,20 @@ def main():
 
     client = chromadb.PersistentClient(path=DB_PATH)
 
-    # Build the embedding function used for BOTH adds and queries
+    # Embedding fn used for both adds and queries
     openai_ef = embedding_functions.OpenAIEmbeddingFunction(
         api_key=os.environ["OPENAI_API_KEY"],
         model_name=EMBED_MODEL,
     )
 
-    # Get or create the collection, with metadata declaring the embed model
+    # Get/create collection with metadata declaring embed model + schema
     col = client.get_or_create_collection(
         name=COLLECTION,
         embedding_function=openai_ef,
         metadata={"embed_model": EMBED_MODEL, "schema_version": SCHEMA_VER},
     )
 
-    # ---- Hard check: existing collection model must match ----
+    # Hard check: existing collection model must match unless forcing reindex
     existing_meta = (col.metadata or {})
     existing_model = existing_meta.get("embed_model")
     if existing_model and existing_model != EMBED_MODEL and os.getenv("FORCE_REINDEX") != "1":
@@ -60,7 +87,7 @@ def main():
             f"  3) Run again with FORCE_REINDEX=1 to overwrite."
         )
 
-    # If forcing reindex, wipe and reset metadata
+    # Optional full reset
     if os.getenv("FORCE_REINDEX") == "1":
         try:
             client.delete_collection(COLLECTION)
@@ -73,32 +100,69 @@ def main():
         )
         print(f"⚠️  FORCE_REINDEX=1: Recreated collection '{COLLECTION}'")
 
+    # Incremental ingest with per-file hashing
+    state = _read_state()
     total_chunks = 0
+    total_skipped = 0
+    total_replaced = 0
+
     for path in pdf_paths:
         fname = os.path.basename(path)
         stem  = os.path.splitext(fname)[0]
 
-        text   = load_pdf_text(path)
+        # Extract and hash full text to detect changes
+        text = load_pdf_text(path)
+        file_hash = _sha256(text)
+        prev_hash = (state.get(fname) or {}).get("file_hash")
+
+        if prev_hash == file_hash:
+            print(f"⏭  Unchanged, skipping: {fname}")
+            total_skipped += 1
+            continue
+
+        # New or changed → re-chunk
         chunks = chunk_text(text)
 
-        ids    = [f"{stem}-chunk-{i}" for i in range(len(chunks))]
-        metas  = [{"source": fname, "idx": i, "embed_model": EMBED_MODEL, "schema_version": SCHEMA_VER}
-                  for i in range(len(chunks))]
+        # Versioned doc_id keeps IDs stable per content version
+        doc_id = f"{stem}:{file_hash[:12]}"
+        ids    = [f"{doc_id}-chunk-{i}" for i in range(len(chunks))]
+        metas  = [{
+            "source": fname,
+            "idx": i,
+            "doc_id": doc_id,
+            "file_hash": file_hash,
+            "embed_model": EMBED_MODEL,
+            "schema_version": SCHEMA_VER
+        } for i in range(len(chunks))]
 
-        # Upsert is idempotent for same IDs (updates doc/metadata+re-embeds if model matches)
+        # If we had an older version for this file, delete its chunks by metadata
+        if prev_hash:
+            try:
+                # Remove previous version (by source + schema) to avoid bloat
+                col.delete(where={"source": fname, "schema_version": SCHEMA_VER})
+                total_replaced += 1
+                print(f"♻️  Replacing older version of: {fname}")
+            except Exception as e:
+                print(f"Delete previous version warning ({fname}):", e)
+
+        # Upsert the new version
         col.upsert(documents=chunks, ids=ids, metadatas=metas)
-
-        print(f"✅ Indexed {len(chunks)} chunks from {fname}")
+        print(f"✅ Indexed {len(chunks)} chunks from {fname} (doc_id={doc_id})")
         total_chunks += len(chunks)
+
+        # Persist new hash in state
+        state[fname] = {"file_hash": file_hash}
+
+    # Save updated state
+    _write_state(state)
 
     try:
         print(f"📦 Collection '{COLLECTION}' now has ~{col.count()} items")
     except Exception:
         pass
 
-    print(f"🎉 Done. Total upserted chunks: {total_chunks}")
-    # Final assert: ensure app and ingest are aligned
-    print(f"🔐 embed_model asserted: {EMBED_MODEL}")
+    print(f"🎉 Done. New/updated chunks: {total_chunks} | Unchanged skipped: {total_skipped} | Files replaced: {total_replaced}")
+    print(f"🔐 embed_model asserted: {EMBED_MODEL} | schema: {SCHEMA_VER}")
 
 if __name__ == "__main__":
     main()
