@@ -28,14 +28,33 @@ def _mask_sender(sender: str) -> str:
     h = hashlib.sha256((sender or "").encode()).hexdigest()
     return f"u_{h[:10]}"
 
+# Insert a newline before inline numbered items like " 1. " or " 2) "
+LISTIFY_RE = re.compile(r'(?<!\n)\s(\d{1,2}[.)])\s')
+
+def enforce_numbered_lines(text: str) -> str:
+    if not text:
+        return text
+    # Normalize weird spaces first (NBSP, narrow NBSP)
+    text = re.sub(r'[\u00A0\u202F]', ' ', text)
+    # Insert newline before numbered tokens glued to a paragraph
+    text = LISTIFY_RE.sub(r'\n\1 ', text)
+    # Compress excessive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
 def sanitize_plain(text: str) -> str:
     if not text:
         return text
-    text = re.sub(r'[*_`~]+', '', text)               # strip markdown markers
-    text = re.sub(r'[\u200b-\u200d\uFEFF]', '', text)  # zero-width chars
+    # strip markdown & zero-widths (incl. WORD JOINER \u2060)
+    text = re.sub(r'[*_`~]+', '', text)
+    text = re.sub(r'[\u200b-\u200d\uFEFF\u2060]', '', text)
+    # normalize NBSPs to real spaces
+    text = re.sub(r'[\u00A0\u202F]', ' ', text)
+    # normalize bullet markers and compress whitespace
     text = re.sub(r'^[•\-\u2022\>]\s*', '- ', text, flags=re.MULTILINE)
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
+
 
 def _open_log_file():
     # Simple size-based rollover at 10MB
@@ -70,6 +89,7 @@ def _log_writer():
                 _LOG_QUEUE.task_done()
             except Exception:
                 pass
+
 threading.Thread(target=_log_writer, daemon=True).start()
 
 def log_interaction(sender: str, payload: dict):
@@ -106,7 +126,6 @@ def _defer_worker():
 
 threading.Thread(target=_defer_worker, daemon=True).start()
 
-
 # ==================== Flask ====================
 app = Flask(__name__)
 
@@ -118,14 +137,14 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 DEBUG = os.getenv("DEBUG") == "1"
 LAST_MENU_AT = {}          # sender -> unix timestamp
-CHOICE_WINDOW = 60        # seconds
+CHOICE_WINDOW = 60         # seconds
 
 # Retrieval / budget tuning
 K = int(os.getenv("K", "4"))
-CONF_DIST = float(os.getenv("CONF_DIST", "1.10"))   # tuned for cosine distance; confirm metric
+CONF_DIST = float(os.getenv("CONF_DIST", "0.40"))   # tuned for cosine distance; confirm metric
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "400"))
 RETRIEVAL_BUDGET = float(os.getenv("RETRIEVAL_BUDGET", "1.5"))      # token multiplier
-RETRIEVAL_TIME_BUDGET = float(os.getenv("RETRIEVAL_TIME_BUDGET", "1.0"))  # seconds
+RETRIEVAL_TIME_BUDGET = float(os.getenv("RETRIEVAL_TIME_BUDGET", "5.0"))  # seconds
 TURN_BUDGET = float(os.getenv("TURN_BUDGET", "10.0"))
 
 # ==================== Clients ====================
@@ -138,8 +157,14 @@ chroma_client = chromadb.PersistentClient(path=DB_PATH)
 openai_ef = embedding_functions.OpenAIEmbeddingFunction(
     api_key=os.environ["OPENAI_API_KEY"], model_name=EMBED_MODEL
 )
+
 collection = chroma_client.get_or_create_collection(
-    name=COLLECTION, embedding_function=openai_ef
+    name=COLLECTION,
+    embedding_function=openai_ef,
+    metadata={
+        "hnsw:space": "cosine",       # <-- sets cosine distance
+        "embed_model": EMBED_MODEL,   # keep model alignment info
+    },
 )
 
 # ==================== Bounded in-memory stores ====================
@@ -424,8 +449,8 @@ def rag_answer_from_posts(question: str, docs: list[str]) -> str:
     try:
         context = _budgeted_context(docs)
         sys = (
-            "You are Margil Gandhi’s assistant. Answer ONLY from the provided context. "
-            "Be direct and concise. If listing multiple points, use a numbered list—one item per line. "
+            "You are Margil Gandhi’s assistant. Answer ONLY using the provided context. "
+            "Be direct and concise. If listing multiple points, output a numbered list with ONE item per line. "
             "Plain text only."
         )
         user = f"Context:\n{context}\n\nQuestion: {question}"
@@ -447,9 +472,8 @@ def best_practice_answer(query: str) -> str:
         sys = (
             "You are a careers/job-search assistant. Be direct and concise. "
             "If listing multiple points, output a numbered list with ONE item per line. "
-            "Plain text only; no markdown or preamble."
+            "Plain text only."
         )
-
         chat = safe_chat_completion(
             CHAT_MODEL,
             messages=[{"role":"system","content":sys},{"role":"user","content":query}],
@@ -464,15 +488,16 @@ def best_practice_answer(query: str) -> str:
 
 # ---- heuristics to control expensive work ----
 def looks_generic(msg: str) -> bool:
-    if not msg: 
-        return True
+    if not msg: return True
     m = msg.strip().lower()
-    if len(m) < 50:
+    if len(m) < 20:
         return True
-    return any(w in m for w in ["help", "tips", "advice", "how to start"]) and len(m) < 140
+    # only treat "tips/advice/help" as generic when *very short*
+    return any(w in m for w in ["help", "tips", "advice", "how to start"]) and len(m) < 80
+
 
 def wants_rag(msg: str) -> bool:
-    if not msg: 
+    if not msg:
         return False
     m = msg.lower()
     if len(m) >= 120:
@@ -507,12 +532,16 @@ def _enqueue_deferred(sender: str, user_text: str):
         # If saturated, skip deferred work rather than affecting next turn latency
         pass
 
-def _log_reply(sender, question, reply_text, from_pdf, confident):
+def _log_reply(sender, question, reply_text, from_pdf, confident,
+               top_dist=None, top_source=None, retrieval_ms=None):
     log_interaction(sender, {
         "question": question,
-        "from_pdf": from_pdf,
+        "from_pdf": from_pdf,           # True if RAG answer path used
         "confident": confident,
         "answer_len": len(reply_text),
+        "top_dist": top_dist,           # float or None
+        "top_source": top_source,       # e.g., PDF filename
+        "retrieval_ms": retrieval_ms,   # int ms or None
     })
 
 # ==================== Retrieval with cache ====================
@@ -521,7 +550,7 @@ def _query_chroma_cached(q_texts, n_results):
         return collection.query(
             query_texts=q_texts,
             n_results=n_results,
-            include=["documents", "distances"],
+            include=["documents", "distances", "metadatas"],  # ← important
         )
     key = (tuple(q_texts), n_results)
     return _CHROMA_CACHE.get_set(key, _compute)
@@ -570,6 +599,7 @@ def whatsapp_reply():
     # EARLY EXIT BEFORE ANY LLM HEAVY WORK
     if looks_generic(user_text):
         txt = best_practice_answer(user_text)
+        txt = enforce_numbered_lines(txt)
         reply = sanitize_plain(txt)
         remember_turn(sender, "assistant", reply)
         _log_reply(sender, user_text, reply, from_pdf=False, confident=False)
@@ -579,20 +609,41 @@ def whatsapp_reply():
     # From here on, we can afford a bit more work
     elapsed = lambda: time.time() - t0
 
+    # ---- Cheap context (make sure these exist) ----
+    try:
+        profile = get_profile(sender)
+    except Exception:
+        profile = {}
+    # summary was refreshed earlier; read whatever we have
+    summary = CONV_SUMMARY.get(sender, "")
 
     # B) maybe-RAG → quick retrieval, then decide
-    confident = False; docs = []
-    if wants_rag(user_text) and elapsed() < TURN_BUDGET * 0.4:
+    confident = False
+    docs = []
+    top = None
+    top_src = None
+    retrieval_ms = None  # duration in milliseconds
+
+    if elapsed() < TURN_BUDGET * 0.4:
         try:
             tR = time.time()
-            res = _query_chroma_cached([user_text], K)
-            tr = time.time() - tR
+            res = _query_chroma_cached([user_text], K)  # includes metadatas
+            retrieval_ms = int((time.time() - tR) * 1000)
 
-            dists = res.get("distances", [[]])[0]
-            docs  = res.get("documents", [[]])[0]
-            top   = dists[0] if dists else None
+            dists = (res.get("distances", [[]]) or [[]])[0]
+            docs  = (res.get("documents", [[]]) or [[]])[0]
+            metas = (res.get("metadatas", [[]]) or [[]])[0]
 
-            # require: good distance, have docs, and keyword overlap
+            top = dists[0] if dists else None
+            top_src = (metas[0].get("source") if metas and isinstance(metas[0], dict) else None)
+
+            app.logger.info(
+                "[rag] top_dist=%s src=%s k=%d time_ms=%s",
+                (round(top, 3) if top is not None else None),
+                top_src, K, retrieval_ms
+            )
+
+            # confidence gate (smaller distance is better for cosine)
             confident = (
                 top is not None and
                 top <= CONF_DIST and
@@ -600,41 +651,66 @@ def whatsapp_reply():
                 rough_keyword_match(user_text, docs[0])
             )
 
-            if tr > RETRIEVAL_TIME_BUDGET:
+            # latency guard
+            if retrieval_ms is not None and (retrieval_ms / 1000.0) > RETRIEVAL_TIME_BUDGET:
                 confident = False
-        except Exception as e:
-            print("retrieval error:", e)
+
+        except Exception:
+            app.logger.exception("retrieval error")
             confident = False
             docs = []
-
-    # Prepare profile+summary only if we proceed to generation
-    summary = ""
-    profile = {}
-    if elapsed() < TURN_BUDGET * 0.6:
-        try:
-            summary = summarize_history(sender)
-            profile = get_profile(sender)
-        except Exception as e:
-            if DEBUG:
-                print("prep context error:", e)
+            top = None
+            top_src = None
+            retrieval_ms = None
 
     # C) generate (one chat max)
     eq = build_effective_query(user_text, profile, summary)
 
     if confident and docs and elapsed() < TURN_BUDGET * 0.7:
+        # ---------- RAG path ----------
         txt = rag_answer_from_posts(eq, docs)
         if not txt or "not in the context" in (txt or "").lower():
             txt = best_practice_answer(user_text)
+        txt = enforce_numbered_lines(txt)
         reply = sanitize_plain(txt)
+
+        if DEBUG:
+            reply += (
+                f"\n\n[diag] rag=yes"
+                f"{' top=' + str(round(top,3)) if top is not None else ''}"
+                f"{' src=' + top_src if top_src else ''}"
+            )
+
         remember_turn(sender, "assistant", reply)
-        _log_reply(sender, user_text, reply, from_pdf=True, confident=True)
+        _log_reply(
+            sender, user_text, reply,
+            from_pdf=True, confident=True,
+            top_dist=top, top_source=top_src, retrieval_ms=retrieval_ms
+        )
         _enqueue_deferred(sender, user_text)
         resp = MessagingResponse(); resp.message(reply); return str(resp)
+
     else:
+        # ---------- Fallback path (no RAG used) ----------
         txt = best_practice_answer(user_text)
+        txt = enforce_numbered_lines(txt)
         reply = sanitize_plain(txt)
+
+        if DEBUG:
+    # even in fallback, include top/src if we have them
+            reply += (
+                "\n\n[diag] rag=no"
+                f"{' top=' + str(round(top,3)) if top is not None else ''}"
+                f"{' src=' + top_src if top_src else ''}"
+            )
+
+
         remember_turn(sender, "assistant", reply)
-        _log_reply(sender, user_text, reply, from_pdf=False, confident=False)
+        _log_reply(
+            sender, user_text, reply,
+            from_pdf=False, confident=False,
+            top_dist=None, top_source=None, retrieval_ms=None
+        )
         _enqueue_deferred(sender, user_text)
         resp = MessagingResponse(); resp.message(reply); return str(resp)
 

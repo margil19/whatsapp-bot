@@ -71,8 +71,38 @@ def main():
     col = client.get_or_create_collection(
         name=COLLECTION,
         embedding_function=openai_ef,
-        metadata={"embed_model": EMBED_MODEL, "schema_version": SCHEMA_VER},
+        metadata={
+            "hnsw:space": "cosine",          # <-- cosine distance
+            "embed_model": EMBED_MODEL,
+            "schema_version": SCHEMA_VER,
+        },
     )
+
+    # Optional full reset
+    if os.getenv("FORCE_REINDEX") == "1":
+        try:
+            client.delete_collection(COLLECTION)
+        except Exception:
+            pass
+        col = client.get_or_create_collection(
+            name=COLLECTION,
+            embedding_function=openai_ef,
+            metadata={
+                "hnsw:space": "cosine",
+                "embed_model": EMBED_MODEL,
+                "schema_version": SCHEMA_VER,
+            },
+        )
+        print(f"⚠️  FORCE_REINDEX=1: Recreated collection '{COLLECTION}'")
+
+    # ---- Count + state control (AFTER potential re-create) ----
+    try:
+        col_count = col.count()
+    except Exception:
+        col_count = 0
+
+    ignore_state = (os.getenv("FORCE_REINDEX") == "1") or (col_count == 0)
+    state = _read_state()
 
     # Hard check: existing collection model must match unless forcing reindex
     existing_meta = (col.metadata or {})
@@ -87,21 +117,7 @@ def main():
             f"  3) Run again with FORCE_REINDEX=1 to overwrite."
         )
 
-    # Optional full reset
-    if os.getenv("FORCE_REINDEX") == "1":
-        try:
-            client.delete_collection(COLLECTION)
-        except Exception:
-            pass
-        col = client.get_or_create_collection(
-            name=COLLECTION,
-            embedding_function=openai_ef,
-            metadata={"embed_model": EMBED_MODEL, "schema_version": SCHEMA_VER},
-        )
-        print(f"⚠️  FORCE_REINDEX=1: Recreated collection '{COLLECTION}'")
-
-    # Incremental ingest with per-file hashing
-    state = _read_state()
+    # ---- Incremental ingest with per-file hashing ----
     total_chunks = 0
     total_skipped = 0
     total_replaced = 0
@@ -115,7 +131,7 @@ def main():
         file_hash = _sha256(text)
         prev_hash = (state.get(fname) or {}).get("file_hash")
 
-        if prev_hash == file_hash:
+        if (not ignore_state) and prev_hash == file_hash:
             print(f"⏭  Unchanged, skipping: {fname}")
             total_skipped += 1
             continue
@@ -136,9 +152,8 @@ def main():
         } for i in range(len(chunks))]
 
         # If we had an older version for this file, delete its chunks by metadata
-        if prev_hash:
+        if prev_hash and (not ignore_state):
             try:
-                # Remove previous version (by source + schema) to avoid bloat
                 col.delete(where={"source": fname, "schema_version": SCHEMA_VER})
                 total_replaced += 1
                 print(f"♻️  Replacing older version of: {fname}")
