@@ -1,3 +1,4 @@
+from flask import Response
 import os
 import time
 import json
@@ -592,6 +593,16 @@ def _query_chroma_cached(q_texts, n_results):
     key = (tuple(q_texts), n_results)
     return _CHROMA_CACHE.get_set(key, _compute)
 
+def twiml_message(msg: str) -> Response:
+    resp = MessagingResponse()
+    resp.message(msg)
+    return Response(str(resp), mimetype="application/xml", status=200)
+
+@app.errorhandler(Exception)
+def handle_any_error(e):
+    app.logger.exception("Unhandled error in request")
+    return twiml_message("Sorry—something went wrong. Send 'menu' to continue.")
+
 # ==================== Routes ====================
 @app.route("/", methods=["GET"])
 def health():
@@ -605,7 +616,7 @@ def whatsapp_reply():
 
     # Ultra-fast exits
     if user_text.lower() == "ping":
-        resp = MessagingResponse(); resp.message("pong"); return str(resp)
+        resp = MessagingResponse(); resp.message("pong"); return twiml_message("pong")
 
     # Menu/help handling (within window logic)
     choice = map_menu_choice_to_query(user_text, sender)
@@ -613,13 +624,13 @@ def whatsapp_reply():
         WELCOME_SEEN.add(sender)
         LAST_MENU_AT[sender] = time.time()
         remember_turn(sender, "assistant", "(menu shown)")
-        resp = MessagingResponse(); resp.message(WELCOME_MENU); return str(resp)
+        resp = MessagingResponse(); resp.message(WELCOME_MENU); return twiml_message(WELCOME_MENU)
 
     # Quick dev command that bypasses RAG
     if user_text.lower().startswith("!fast "):
         query = user_text.split(" ", 1)[1]
         txt = best_practice_answer(sender, query)
-        resp = MessagingResponse(); resp.message(sanitize_plain(txt)); return str(resp)
+        resp = MessagingResponse(); resp.message(sanitize_plain(txt)); return twiml_message(sanitize_plain(txt))
 
     # Normalize menu number selection (only valid shortly after menu)
     mapped = map_menu_choice_to_query(user_text, sender)
@@ -645,7 +656,7 @@ def whatsapp_reply():
         remember_turn(sender, "assistant", reply)
         _log_reply(sender, user_text, reply, from_pdf=False, confident=False)
         _enqueue_deferred(sender, user_text)  # defer profile extraction only
-        resp = MessagingResponse(); resp.message(reply); return str(resp)
+        resp = MessagingResponse(); resp.message(reply); return twiml_message(reply)
 
     # From here on, we can afford a bit more work
     elapsed = lambda: time.time() - t0
@@ -730,7 +741,7 @@ def whatsapp_reply():
             top_dist=top, top_source=top_src, retrieval_ms=retrieval_ms
         )
         _enqueue_deferred(sender, user_text)
-        resp = MessagingResponse(); resp.message(reply); return str(resp)
+        resp = MessagingResponse(); resp.message(reply); return twiml_message(reply)
 
     else:
         # ---------- Fallback path (no RAG used) ----------
@@ -754,7 +765,7 @@ def whatsapp_reply():
             top_dist=None, top_source=None, retrieval_ms=None
         )
         _enqueue_deferred(sender, user_text)
-        resp = MessagingResponse(); resp.message(reply); return str(resp)
+        resp = MessagingResponse(); resp.message(reply); return twiml_message(reply)
 
 @app.route("/stats", methods=["GET"])
 def stats():
