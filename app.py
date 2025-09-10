@@ -444,11 +444,37 @@ def _budgeted_context(docs: list[str]) -> str:
             used += len(piece.split())
     return "\n\n".join(kept)
 
+def _normalize_to_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        lines = []
+        for i, item in enumerate(value, 1):
+            if isinstance(item, (str, int, float)):
+                s = str(item)
+            elif isinstance(item, dict):
+                # prefer common text field, else compact dict
+                s = item.get("text") or ", ".join(
+                    f"{k}: {v}" for k, v in item.items()
+                    if isinstance(v, (str, int, float))
+                )
+            else:
+                s = str(item)
+            s = (s or "").strip()
+            if s:
+                lines.append(f"{i}. {s}")
+        return "\n".join(lines)
+    # fallback for numbers/objects
+    return str(value)
+
+
 def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 40) -> str:
     """
     Parse a single-call model response that contains both the 'answer' and a compact 'summary'.
-    Updates CONV_SUMMARY[sender] inline; returns just the answer text.
-    Accepts JSON {"answer": "...", "summary": "..."} or a fallback ANSWER/SUMMARY block.
+    Updates CONV_SUMMARY[sender] inline; returns just the answer text (always a string).
+    Accepts JSON {"answer": ..., "summary": "..."} or a fallback ANSWER/SUMMARY block.
     """
     ans, summ = None, None
     try:
@@ -459,7 +485,7 @@ def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 4
     except Exception:
         pass
 
-    if not ans:
+    if ans is None:
         # Fallback to labeled blocks, robust to minor formatting
         m_ans = re.search(r"ANSWER:\s*(.+?)(?:\n\s*SUMMARY:|\Z)", raw, re.S | re.I)
         if m_ans:
@@ -467,10 +493,25 @@ def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 4
         else:
             ans = raw.strip()
 
+    # Normalize answer to string (handles lists/dicts/etc.)
+    ans = _normalize_to_text(ans)
+
     if not summ:
         m_sum = re.search(r"SUMMARY:\s*(.+)$", raw, re.S | re.I)
         if m_sum:
             summ = m_sum.group(1).strip()
+
+    # Ensure summary is a short string
+    if isinstance(summ, (list, dict, int, float)):
+        summ = _normalize_to_text(summ)
+    if summ:
+        summ = clip_words(summ, max_words)
+        CONV_SUMMARY[sender] = summ
+        if hasattr(CONV_SUMMARY, "touch"):
+            CONV_SUMMARY.touch(sender)
+
+    return ans
+
 
     # Clip and store the summary inline (keeps personalization fresh with zero extra calls)
     if summ:
