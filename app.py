@@ -636,12 +636,7 @@ def whatsapp_reply():
 
     # --- ALWAYS record user turn + (optionally) refresh summary inline ---
     remember_turn(sender, "user", user_text)
-    # Only summarize when it's NOT a quick menu pick and we have headroom
-    if (not is_menu_pick) and (time.time() - t0 < 0.5):
-        try:
-            _ = summarize_history(sender, max_turns=3, max_words=40)
-        except Exception:
-            pass
+
 
     # EARLY EXIT BEFORE ANY LLM HEAVY WORK
     if looks_generic(user_text):
@@ -664,102 +659,86 @@ def whatsapp_reply():
     # summary was refreshed earlier; read whatever we have
     summary = CONV_SUMMARY.get(sender, "")
 
-    # B) maybe-RAG → quick retrieval, then decide
-    confident = False
+    # --- Decide RAG cheaply, then make exactly one chat call ---
+    confident = False  # kept for logging compatibility
+    use_rag = False
     docs = []
     top = None
     top_src = None
-    retrieval_ms = None  # duration in milliseconds
+    retrieval_ms = None
 
-    if elapsed() < TURN_BUDGET * 0.4:
-        try:
-            tR = time.time()
-            res = _query_chroma_cached([user_text], K)  # includes metadatas
-            retrieval_ms = int((time.time() - tR) * 1000)
+    # Time-boxed retrieval gate
+    try:
+        tR = time.time()
+        res = _query_chroma_cached([user_text], K)  # includes metadatas
+        retrieval_ms = int((time.time() - tR) * 1000)
 
-            dists = (res.get("distances", [[]]) or [[]])[0]
-            docs  = (res.get("documents", [[]]) or [[]])[0]
-            metas = (res.get("metadatas", [[]]) or [[]])[0]
+        dists = (res.get("distances", [[]]) or [[]])[0]
+        docs  = (res.get("documents", [[]]) or [[]])[0]
+        metas = (res.get("metadatas", [[]]) or [[]])[0]
 
-            top = dists[0] if dists else None
-            top_src = (metas[0].get("source") if metas and isinstance(metas[0], dict) else None)
+        top = dists[0] if dists else None
+        top_src = (metas[0].get("source") if metas and isinstance(metas[0], dict) else None)
 
-            app.logger.info(
-                "[rag] top_dist=%s src=%s k=%d time_ms=%s",
-                (round(top, 3) if top is not None else None),
-                top_src, K, retrieval_ms
-            )
+        app.logger.info(
+            "[rag] top_dist=%s src=%s k=%d time_ms=%s",
+            (round(top, 3) if top is not None else None),
+            top_src, K, retrieval_ms
+        )
 
-            # confidence gate (smaller distance is better for cosine)
-            confident = (
-                top is not None and
-                top <= CONF_DIST and
-                bool(docs) and
-                rough_keyword_match(user_text, docs[0])
-            )
+        # confidence gate (smaller distance is better for cosine)
+        confident = (
+            top is not None and
+            top <= CONF_DIST and
+            bool(docs) and
+            rough_keyword_match(user_text, docs[0])
+        )
 
-            # latency guard
-            if retrieval_ms is not None and (retrieval_ms / 1000.0) > RETRIEVAL_TIME_BUDGET:
-                confident = False
+        # latency guard – only use RAG if retrieval stayed within budget
+        if confident and (retrieval_ms is not None) and ((retrieval_ms / 1000.0) <= RETRIEVAL_TIME_BUDGET):
+            use_rag = True
 
-        except Exception:
-            app.logger.exception("retrieval error")
-            confident = False
-            docs = []
-            top = None
-            top_src = None
-            retrieval_ms = None
+    except Exception:
+        app.logger.exception("retrieval error")
+        confident = False
+        use_rag = False
+        docs = []
+        top = None
+        top_src = None
+        retrieval_ms = None
 
-    # C) generate (one chat max)
+    # Build effective query with whatever summary we already have
     eq = build_effective_query(user_text, profile, summary)
 
-    if confident and docs and elapsed() < TURN_BUDGET * 0.7:
-        # ---------- RAG path ----------
+    # Exactly ONE chat-completion:
+    if use_rag:
         txt = rag_answer_from_posts(sender, eq, docs)
-        if not txt or "not in the context" in (txt or "").lower():
-            txt = best_practice_answer(sender, user_text)
-
-        txt = enforce_numbered_lines(txt)
-        reply = sanitize_plain(txt)
-
-        if DEBUG:
-            reply += (
-                f"\n\n[diag] rag=yes"
-                f"{' top=' + str(round(top,3)) if top is not None else ''}"
-                f"{' src=' + top_src if top_src else ''}"
-            )
-
-        remember_turn(sender, "assistant", reply)
-        _log_reply(
-            sender, user_text, reply,
-            from_pdf=True, confident=True,
-            top_dist=top, top_source=top_src, retrieval_ms=retrieval_ms
-        )
-        _enqueue_deferred(sender, user_text)
-        return twiml_message(reply)
-
     else:
-        # ---------- Fallback path (no RAG used) ----------
         txt = best_practice_answer(sender, user_text)
-        txt = enforce_numbered_lines(txt)
-        reply = sanitize_plain(txt)
 
-        if DEBUG:
-            # even in fallback, include top/src if we have them
-            reply += (
-                "\n\n[diag] rag=no"
-                f"{' top=' + str(round(top,3)) if top is not None else ''}"
-                f"{' src=' + top_src if top_src else ''}"
-            )
+    # Post-process + reply
+    txt = enforce_numbered_lines(txt)
+    reply = sanitize_plain(txt)
 
-        remember_turn(sender, "assistant", reply)
-        _log_reply(
-            sender, user_text, reply,
-            from_pdf=False, confident=False,
-            top_dist=None, top_source=None, retrieval_ms=None
+    if DEBUG:
+        reply += (
+            f"\n\n[diag] rag={'yes' if use_rag else 'no'}"
+            f"{' top=' + str(round(top,3)) if top is not None else ''}"
+            f"{' src=' + top_src if top_src else ''}"
+            f"{' t=' + str(retrieval_ms) + 'ms' if retrieval_ms is not None else ''}"
         )
-        _enqueue_deferred(sender, user_text)
-        return twiml_message(reply)
+
+    remember_turn(sender, "assistant", reply)
+    _log_reply(
+        sender, user_text, reply,
+        from_pdf=use_rag, confident=use_rag,
+        top_dist=top if use_rag else None,
+        top_source=top_src if use_rag else None,
+        retrieval_ms=retrieval_ms if use_rag else None
+    )
+    _enqueue_deferred(sender, user_text)
+    return twiml_message(reply)
+
 
 @app.route("/stats", methods=["GET"])
 def stats():
