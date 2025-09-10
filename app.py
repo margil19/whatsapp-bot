@@ -444,47 +444,84 @@ def _budgeted_context(docs: list[str]) -> str:
             used += len(piece.split())
     return "\n\n".join(kept)
 
-def rag_answer_from_posts(question: str, docs: list[str]) -> str:
-    """Answer ONLY from retrieved docs; compact context; resilient to errors."""
+def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 40) -> str:
+    """
+    Parse a single-call model response that contains both the 'answer' and a compact 'summary'.
+    Updates CONV_SUMMARY[sender] inline; returns just the answer text.
+    Accepts JSON {"answer": "...", "summary": "..."} or a fallback ANSWER/SUMMARY block.
+    """
+    ans, summ = None, None
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            ans = obj.get("answer")
+            summ = obj.get("summary")
+    except Exception:
+        pass
+
+    if not ans:
+        # Fallback to labeled blocks, robust to minor formatting
+        m_ans = re.search(r"ANSWER:\s*(.+?)(?:\n\s*SUMMARY:|\Z)", raw, re.S | re.I)
+        if m_ans:
+            ans = m_ans.group(1).strip()
+        else:
+            ans = raw.strip()
+
+    if not summ:
+        m_sum = re.search(r"SUMMARY:\s*(.+)$", raw, re.S | re.I)
+        if m_sum:
+            summ = m_sum.group(1).strip()
+
+    # Clip and store the summary inline (keeps personalization fresh with zero extra calls)
+    if summ:
+        summ = clip_words(summ, max_words)
+        CONV_SUMMARY[sender] = summ
+        if hasattr(CONV_SUMMARY, "touch"):
+            CONV_SUMMARY.touch(sender)
+
+    return ans
+
+def rag_answer_from_posts(sender: str, question: str, docs: list[str]) -> str:
     try:
         context = _budgeted_context(docs)
         sys = (
-            "You are Margil Gandhi’s assistant. Answer ONLY using the provided context. "
-            "Be direct and concise. If listing multiple points, output a numbered list with ONE item per line. "
-            "Plain text only."
-        )
-        user = f"Context:\n{context}\n\nQuestion: {question}"
+            "You are Margil Gandhi’s assistant. Use ONLY the provided context."
+            " Return STRICT JSON with keys: answer, summary.\n"
+            " - 'answer': the concise reply for the user (<= {mx} tokens).\n"
+            " - 'summary': <= 40 words updating the conversation state "
+            "(target role/level/industry/location/constraints/current topic)."
+        ).format(mx=MAX_TOKENS)
+        user = f"Context:\n{context}\n\nQuestion: {question}\n\nReturn JSON only."
         chat = safe_chat_completion(
             CHAT_MODEL,
             messages=[{"role":"system","content":sys},{"role":"user","content":user}],
             temperature=0.2
         )
-        text = (chat.choices[0].message.content or "").strip()
-        return clip_words(text, int(MAX_TOKENS / 1.3))
+        raw = (chat.choices[0].message.content or "").strip()
+        return _extract_answer_and_update_summary(sender, raw)
     except Exception as e:
-        if DEBUG:
-            print("rag_answer_from_posts error:", e)
+        if DEBUG: print("rag_answer_from_posts error:", e)
         return "Sorry—I ran into an issue using the PDF context. Try asking again in a moment."
 
-def best_practice_answer(query: str) -> str:
-    """Fast, general fallback; short, practical; resilient to timeouts/errors."""
+
+def best_practice_answer(sender: str, query: str) -> str:
     try:
         sys = (
-            "You are a careers/job-search assistant. Be direct and concise. "
-            "If listing multiple points, output a numbered list with ONE item per line. "
-            "Plain text only."
+            "You are a careers/job-search assistant. Return STRICT JSON with keys: answer, summary.\n"
+            " - 'answer': direct, concise; numbered list with ONE item per line when listing.\n"
+            " - 'summary': <= 40 words updating the conversation state (role/level/industry/location/constraints/topic)."
         )
         chat = safe_chat_completion(
             CHAT_MODEL,
             messages=[{"role":"system","content":sys},{"role":"user","content":query}],
             temperature=0.3
         )
-        text = (chat.choices[0].message.content or "").strip()
-        return clip_words(text, int(MAX_TOKENS / 1.3))
+        raw = (chat.choices[0].message.content or "").strip()
+        return _extract_answer_and_update_summary(sender, raw)
     except Exception as e:
-        if DEBUG:
-            print("best_practice_answer error:", e)
+        if DEBUG: print("best_practice_answer error:", e)
         return "Sorry—I’m a bit busy right now. Please try again."
+
 
 # ---- heuristics to control expensive work ----
 def looks_generic(msg: str) -> bool:
@@ -581,24 +618,28 @@ def whatsapp_reply():
     # Quick dev command that bypasses RAG
     if user_text.lower().startswith("!fast "):
         query = user_text.split(" ", 1)[1]
-        txt = best_practice_answer(query)
+        txt = best_practice_answer(sender, query)
         resp = MessagingResponse(); resp.message(sanitize_plain(txt)); return str(resp)
 
     # Normalize menu number selection (only valid shortly after menu)
     mapped = map_menu_choice_to_query(user_text, sender)
-    if mapped is not None and mapped != "__MENU__":
+    is_menu_pick = (mapped is not None and mapped != "__MENU__")
+    if is_menu_pick:
         user_text = mapped
 
     # --- ALWAYS record user turn + refresh summary inline (keep memory fresh) ---
+
     remember_turn(sender, "user", user_text)
-    try:
-        _ = summarize_history(sender)  # tiny prompt; ignore errors to keep path fast
-    except Exception:
-        pass
+# Only summarize when it's NOT a quick menu pick and we have headroom
+    if (not is_menu_pick) and (time.time() - t0 < 0.5):
+        try:
+            _ = summarize_history(sender, max_turns=3, max_words=40)
+        except Exception:
+            pass
 
     # EARLY EXIT BEFORE ANY LLM HEAVY WORK
     if looks_generic(user_text):
-        txt = best_practice_answer(user_text)
+        txt = best_practice_answer(sender, user_text)
         txt = enforce_numbered_lines(txt)
         reply = sanitize_plain(txt)
         remember_turn(sender, "assistant", reply)
@@ -623,7 +664,7 @@ def whatsapp_reply():
     top = None
     top_src = None
     retrieval_ms = None  # duration in milliseconds
-
+    
     if elapsed() < TURN_BUDGET * 0.4:
         try:
             tR = time.time()
@@ -668,9 +709,10 @@ def whatsapp_reply():
 
     if confident and docs and elapsed() < TURN_BUDGET * 0.7:
         # ---------- RAG path ----------
-        txt = rag_answer_from_posts(eq, docs)
+        txt = rag_answer_from_posts(sender, eq, docs)
         if not txt or "not in the context" in (txt or "").lower():
-            txt = best_practice_answer(user_text)
+            txt = best_practice_answer(sender, user_text)
+
         txt = enforce_numbered_lines(txt)
         reply = sanitize_plain(txt)
 
@@ -692,7 +734,7 @@ def whatsapp_reply():
 
     else:
         # ---------- Fallback path (no RAG used) ----------
-        txt = best_practice_answer(user_text)
+        txt = best_practice_answer(sender, user_text)
         txt = enforce_numbered_lines(txt)
         reply = sanitize_plain(txt)
 
