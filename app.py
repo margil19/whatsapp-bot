@@ -32,16 +32,25 @@ def _mask_sender(sender: str) -> str:
 # Insert a newline before inline numbered items like " 1. " or " 2) "
 LISTIFY_RE = re.compile(r'(?<!\n)\s(\d{1,2}[.)])\s')
 
+LISTIFY_RE = re.compile(r'(?<!\n)\s(\d{1,3}[.)])\s')
+_DUP_PREFIX = re.compile(r'(?m)^\s*(\d{1,3}[.)])\s+\1\s+')
+_LONE_NUM_LINE = re.compile(r'(?m)^\s*\d{1,3}[.)]\s*$')
+
 def enforce_numbered_lines(text: str) -> str:
     if not text:
         return text
-    # Normalize weird spaces first (NBSP, narrow NBSP)
-    text = re.sub(r'[\u00A0\u202F]', ' ', text)
-    # Insert newline before numbered tokens glued to a paragraph
+    # normalize odd spaces (NBSP, narrow NBSP, word-joiner)
+    text = re.sub(r'[\u00A0\u202F\u2060]', ' ', text)
+    # insert newline before inline numbering
     text = LISTIFY_RE.sub(r'\n\1 ', text)
-    # Compress excessive blank lines
+    # drop lines that are just "1." / "2." etc.
+    text = _LONE_NUM_LINE.sub('', text)
+    # collapse "n. n. " to "n. "
+    text = _DUP_PREFIX.sub(r'\1 ', text)
+    # tidy blank lines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
 
 def sanitize_plain(text: str) -> str:
     if not text:
@@ -452,22 +461,14 @@ def _normalize_to_text(value) -> str:
     if isinstance(value, list):
         lines = []
         for i, item in enumerate(value, 1):
-            if isinstance(item, (str, int, float)):
-                s = str(item)
-            elif isinstance(item, dict):
-                # prefer common text field, else compact dict
-                s = item.get("text") or ", ".join(
-                    f"{k}: {v}" for k, v in item.items()
-                    if isinstance(v, (str, int, float))
-                )
-            else:
-                s = str(item)
-            s = (s or "").strip()
+            s = str(item).strip()
+            # remove leading bullets or numbering once
+            s = re.sub(r'^\s*(?:[-–—•●*·]|\d{1,3}[.)])\s+', '', s)
             if s:
                 lines.append(f"{i}. {s}")
         return "\n".join(lines)
-    # fallback for numbers/objects
     return str(value)
+
 
 
 def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 40) -> str:
