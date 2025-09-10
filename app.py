@@ -56,7 +56,6 @@ def sanitize_plain(text: str) -> str:
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
 
-
 def _open_log_file():
     # Simple size-based rollover at 10MB
     try:
@@ -142,7 +141,7 @@ CHOICE_WINDOW = 60         # seconds
 
 # Retrieval / budget tuning
 K = int(os.getenv("K", "4"))
-CONF_DIST = float(os.getenv("CONF_DIST", "0.40"))   # tuned for cosine distance; confirm metric
+CONF_DIST = float(os.getenv("CONF_DIST", "0.40"))   # tuned for cosine distance; smaller is better
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "400"))
 RETRIEVAL_BUDGET = float(os.getenv("RETRIEVAL_BUDGET", "1.5"))      # token multiplier
 RETRIEVAL_TIME_BUDGET = float(os.getenv("RETRIEVAL_TIME_BUDGET", "5.0"))  # seconds
@@ -504,7 +503,6 @@ def rag_answer_from_posts(sender: str, question: str, docs: list[str]) -> str:
         if DEBUG: print("rag_answer_from_posts error:", e)
         return "Sorry—I ran into an issue using the PDF context. Try asking again in a moment."
 
-
 def best_practice_answer(sender: str, query: str) -> str:
     try:
         sys = (
@@ -523,7 +521,6 @@ def best_practice_answer(sender: str, query: str) -> str:
         if DEBUG: print("best_practice_answer error:", e)
         return "Sorry—I’m a bit busy right now. Please try again."
 
-
 # ---- heuristics to control expensive work ----
 def looks_generic(msg: str) -> bool:
     if not msg: return True
@@ -532,7 +529,6 @@ def looks_generic(msg: str) -> bool:
         return True
     # only treat "tips/advice/help" as generic when *very short*
     return any(w in m for w in ["help", "tips", "advice", "how to start"]) and len(m) < 80
-
 
 def wants_rag(msg: str) -> bool:
     if not msg:
@@ -616,7 +612,7 @@ def whatsapp_reply():
 
     # Ultra-fast exits
     if user_text.lower() == "ping":
-        resp = MessagingResponse(); resp.message("pong"); return twiml_message("pong")
+        return twiml_message("pong")
 
     # Menu/help handling (within window logic)
     choice = map_menu_choice_to_query(user_text, sender)
@@ -624,13 +620,13 @@ def whatsapp_reply():
         WELCOME_SEEN.add(sender)
         LAST_MENU_AT[sender] = time.time()
         remember_turn(sender, "assistant", "(menu shown)")
-        resp = MessagingResponse(); resp.message(WELCOME_MENU); return twiml_message(WELCOME_MENU)
+        return twiml_message(WELCOME_MENU)
 
     # Quick dev command that bypasses RAG
     if user_text.lower().startswith("!fast "):
         query = user_text.split(" ", 1)[1]
         txt = best_practice_answer(sender, query)
-        resp = MessagingResponse(); resp.message(sanitize_plain(txt)); return twiml_message(sanitize_plain(txt))
+        return twiml_message(sanitize_plain(txt))
 
     # Normalize menu number selection (only valid shortly after menu)
     mapped = map_menu_choice_to_query(user_text, sender)
@@ -638,10 +634,9 @@ def whatsapp_reply():
     if is_menu_pick:
         user_text = mapped
 
-    # --- ALWAYS record user turn + refresh summary inline (keep memory fresh) ---
-
+    # --- ALWAYS record user turn + (optionally) refresh summary inline ---
     remember_turn(sender, "user", user_text)
-# Only summarize when it's NOT a quick menu pick and we have headroom
+    # Only summarize when it's NOT a quick menu pick and we have headroom
     if (not is_menu_pick) and (time.time() - t0 < 0.5):
         try:
             _ = summarize_history(sender, max_turns=3, max_words=40)
@@ -656,7 +651,7 @@ def whatsapp_reply():
         remember_turn(sender, "assistant", reply)
         _log_reply(sender, user_text, reply, from_pdf=False, confident=False)
         _enqueue_deferred(sender, user_text)  # defer profile extraction only
-        resp = MessagingResponse(); resp.message(reply); return twiml_message(reply)
+        return twiml_message(reply)
 
     # From here on, we can afford a bit more work
     elapsed = lambda: time.time() - t0
@@ -675,7 +670,7 @@ def whatsapp_reply():
     top = None
     top_src = None
     retrieval_ms = None  # duration in milliseconds
-    
+
     if elapsed() < TURN_BUDGET * 0.4:
         try:
             tR = time.time()
@@ -741,7 +736,7 @@ def whatsapp_reply():
             top_dist=top, top_source=top_src, retrieval_ms=retrieval_ms
         )
         _enqueue_deferred(sender, user_text)
-        resp = MessagingResponse(); resp.message(reply); return twiml_message(reply)
+        return twiml_message(reply)
 
     else:
         # ---------- Fallback path (no RAG used) ----------
@@ -750,13 +745,12 @@ def whatsapp_reply():
         reply = sanitize_plain(txt)
 
         if DEBUG:
-    # even in fallback, include top/src if we have them
+            # even in fallback, include top/src if we have them
             reply += (
                 "\n\n[diag] rag=no"
                 f"{' top=' + str(round(top,3)) if top is not None else ''}"
                 f"{' src=' + top_src if top_src else ''}"
             )
-
 
         remember_turn(sender, "assistant", reply)
         _log_reply(
@@ -765,7 +759,7 @@ def whatsapp_reply():
             top_dist=None, top_source=None, retrieval_ms=None
         )
         _enqueue_deferred(sender, user_text)
-        resp = MessagingResponse(); resp.message(reply); return twiml_message(reply)
+        return twiml_message(reply)
 
 @app.route("/stats", methods=["GET"])
 def stats():
