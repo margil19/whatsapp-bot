@@ -99,14 +99,18 @@ def _log_writer():
             except Exception:
                 pass
 
+<<<<<<< HEAD
 threading.Thread(target=_log_writer, daemon=True).start()
 
+=======
+>>>>>>> 783b833 (Update: bot code)
 def log_interaction(sender: str, payload: dict):
     try:
         _LOG_QUEUE.put_nowait((sender, payload))
     except Exception:
         print("log_interaction: queue full; dropping log line.")
 
+<<<<<<< HEAD
 # --- Defer only profile extraction (no summarization here) ---
 _DEFER_QUEUE: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=1000)
 
@@ -134,6 +138,8 @@ def _defer_worker():
                 pass
 
 threading.Thread(target=_defer_worker, daemon=True).start()
+=======
+>>>>>>> 783b833 (Update: bot code)
 
 # ==================== Flask ====================
 app = Flask(__name__)
@@ -320,6 +326,7 @@ PROFILE_HINT_RE = re.compile(
     r"switch|transition|linkedin|portfolio|resume|cv|github|url|http[s]?://)\b",
     re.IGNORECASE,
 )
+<<<<<<< HEAD
 def _looks_like_profile_update(text: str) -> bool:
     return bool(text and PROFILE_HINT_RE.search(text))
 
@@ -419,6 +426,8 @@ def extract_profile_updates(sender: str, user_text: str) -> None:
         if DEBUG:
             print("extract_profile_updates error:", e)
         return
+=======
+>>>>>>> 783b833 (Update: bot code)
 
 def build_effective_query(user_msg: str, profile: dict, summary: str) -> str:
     parts = [user_msg]
@@ -469,10 +478,59 @@ def _normalize_to_text(value) -> str:
         return "\n".join(lines)
     return str(value)
 
+<<<<<<< HEAD
+=======
+def _merge_profile(sender: str, data: dict):
+    """Merge optional 'profile' dict from model output into USER_PROFILE inline."""
+    if not isinstance(data, dict):
+        return
+    prof = get_profile(sender)
+
+    # links (dedupe + normalize)
+    links = data.get("links")
+    if isinstance(links, list):
+        clean = []
+        for u in links:
+            if isinstance(u, str):
+                u = u.strip()
+                if not u:
+                    continue
+                if not re.match(r"^https?://", u, flags=re.I):
+                    if re.match(r"^[\w.-]+\.[a-z]{2,}(/.*)?$", u, flags=re.I):
+                        u = "https://" + u
+                    else:
+                        continue
+                clean.append(u)
+        if clean:
+            prof["links"] = list(set((prof.get("links") or []) + clean))
+
+    # scalar fields
+    for k in ("role", "level", "location", "industry", "goals"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            prof[k] = v.strip()
+
+    # years
+    y = data.get("years")
+    if isinstance(y, (int, float)):
+        prof["years"] = float(y)
+    elif isinstance(y, str):
+        m = re.search(r"\d+(\.\d+)?", y)
+        if m:
+            try:
+                prof["years"] = float(m.group(0))
+            except Exception:
+                pass
+
+    USER_PROFILE[sender] = prof
+    if hasattr(USER_PROFILE, "touch"):
+        USER_PROFILE.touch(sender)
+>>>>>>> 783b833 (Update: bot code)
 
 
 def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 40) -> str:
     """
+<<<<<<< HEAD
     Parse a single-call model response that contains both the 'answer' and a compact 'summary'.
     Updates CONV_SUMMARY[sender] inline; returns just the answer text (always a string).
     Accepts JSON {"answer": ..., "summary": "..."} or a fallback ANSWER/SUMMARY block.
@@ -497,12 +555,46 @@ def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 4
     # Normalize answer to string (handles lists/dicts/etc.)
     ans = _normalize_to_text(ans)
 
+=======
+    Parse model output returning JSON {answer, summary, profile?}.
+    - Updates CONV_SUMMARY inline from 'summary'.
+    - Merges optional 'profile' into USER_PROFILE inline.
+    - Always returns a STRING answer (lists normalized to numbered lines).
+    """
+    ans, summ = None, None
+
+    # Try JSON first
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            ans  = obj.get("answer")
+            summ = obj.get("summary")
+            prof = obj.get("profile")
+            if isinstance(prof, dict):
+                _merge_profile(sender, prof)
+    except Exception:
+        pass
+
+    # Fallback to labeled blocks if not valid JSON
+    if ans is None:
+        m_ans = re.search(r"ANSWER:\s*(.+?)(?:\n\s*SUMMARY:|\Z)", raw, re.S | re.I)
+        ans = (m_ans.group(1).strip() if m_ans else raw.strip())
+
+    # Normalize answer to plain text (handles list/dict)
+    ans = _normalize_to_text(ans)
+
+    # Pull summary if missing in JSON and present in blocks
+>>>>>>> 783b833 (Update: bot code)
     if not summ:
         m_sum = re.search(r"SUMMARY:\s*(.+)$", raw, re.S | re.I)
         if m_sum:
             summ = m_sum.group(1).strip()
 
+<<<<<<< HEAD
     # Ensure summary is a short string
+=======
+    # Ensure summary is short string and store
+>>>>>>> 783b833 (Update: bot code)
     if isinstance(summ, (list, dict, int, float)):
         summ = _normalize_to_text(summ)
     if summ:
@@ -513,6 +605,7 @@ def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 4
 
     return ans
 
+<<<<<<< HEAD
 
     # Clip and store the summary inline (keeps personalization fresh with zero extra calls)
     if summ:
@@ -523,16 +616,35 @@ def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 4
 
     return ans
 
+=======
+>>>>>>> 783b833 (Update: bot code)
 def rag_answer_from_posts(sender: str, question: str, docs: list[str]) -> str:
     try:
         context = _budgeted_context(docs)
         sys = (
+<<<<<<< HEAD
             "You are Margil Gandhi’s assistant. Use ONLY the provided context."
             " Return STRICT JSON with keys: answer, summary.\n"
             " - 'answer': the concise reply for the user (<= {mx} tokens).\n"
             " - 'summary': <= 40 words updating the conversation state "
             "(target role/level/industry/location/constraints/current topic)."
         ).format(mx=MAX_TOKENS)
+=======
+            "You are Margil Gandhi’s assistant. Use ONLY the provided context. "
+            "Return STRICT JSON with keys: answer, summary, profile (optional). "
+            "Formatting rules for 'answer': "
+            "(a) If the user asks for a draft/template/email/message/cover letter/outreach, "
+            "return ONE string that is a clean, ready-to-send draft (include 'Subject:' when appropriate; "
+            "use natural paragraphs and line breaks; NO numbering or bullets). "
+            "(b) If the user asks for tips/steps/checklist/ideas/examples or requests N items, "
+            "return an ARRAY of short strings (each one item; NO numbering or bullets inside items). "
+            "(c) Otherwise return ONE concise paragraph string. "
+            "'summary': <= 40 words capturing role/level/industry/location/constraints/topic. "
+            "'profile' (optional): {role, level, location, years, industry, goals, links}. "
+            "JSON only."
+        ).format(mx=MAX_TOKENS)
+
+>>>>>>> 783b833 (Update: bot code)
         user = f"Context:\n{context}\n\nQuestion: {question}\n\nReturn JSON only."
         chat = safe_chat_completion(
             CHAT_MODEL,
@@ -545,6 +657,7 @@ def rag_answer_from_posts(sender: str, question: str, docs: list[str]) -> str:
         if DEBUG: print("rag_answer_from_posts error:", e)
         return "Sorry—I ran into an issue using the PDF context. Try asking again in a moment."
 
+<<<<<<< HEAD
 def best_practice_answer(sender: str, query: str) -> str:
     try:
         sys = (
@@ -552,6 +665,26 @@ def best_practice_answer(sender: str, query: str) -> str:
             " - 'answer': direct, concise; numbered list with ONE item per line when listing.\n"
             " - 'summary': <= 40 words updating the conversation state (role/level/industry/location/constraints/topic)."
         )
+=======
+
+def best_practice_answer(sender: str, query: str) -> str:
+    try:
+        sys = (
+            "You are a careers/job-search assistant. "
+            "Return STRICT JSON with keys: answer, summary, profile (optional). "
+            "Formatting rules for 'answer': "
+            "(a) If the user asks for a draft/template/email/message/cover letter/outreach, "
+            "return ONE string that is a clean, ready-to-send draft (include 'Subject:' when appropriate; "
+            "use natural paragraphs and line breaks; NO numbering or bullets). "
+            "(b) If the user asks for tips/steps/checklist/ideas/examples or requests N items, "
+            "return an ARRAY of short strings (each one item; NO numbering or bullets inside items). "
+            "(c) Otherwise return ONE concise paragraph string. "
+            "'summary': <= 40 words capturing role/level/industry/location/constraints/topic. "
+            "'profile' (optional): {role, level, location, years, industry, goals, links}. "
+            "JSON only."
+        )
+
+>>>>>>> 783b833 (Update: bot code)
         chat = safe_chat_completion(
             CHAT_MODEL,
             messages=[{"role":"system","content":sys},{"role":"user","content":query}],
@@ -563,6 +696,10 @@ def best_practice_answer(sender: str, query: str) -> str:
         if DEBUG: print("best_practice_answer error:", e)
         return "Sorry—I’m a bit busy right now. Please try again."
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 783b833 (Update: bot code)
 # ---- heuristics to control expensive work ----
 def looks_generic(msg: str) -> bool:
     if not msg: return True
@@ -601,12 +738,15 @@ def map_menu_choice_to_query(text: str, sender: str | None = None) -> str | None
                 return WELCOME_QUESTIONS[i]
     return None
 
+<<<<<<< HEAD
 def _enqueue_deferred(sender: str, user_text: str):
     try:
         _DEFER_QUEUE.put_nowait((sender, user_text))
     except Exception:
         # If saturated, skip deferred work rather than affecting next turn latency
         pass
+=======
+>>>>>>> 783b833 (Update: bot code)
 
 def _log_reply(sender, question, reply_text, from_pdf, confident,
                top_dist=None, top_source=None, retrieval_ms=None):
@@ -687,7 +827,10 @@ def whatsapp_reply():
         reply = sanitize_plain(txt)
         remember_turn(sender, "assistant", reply)
         _log_reply(sender, user_text, reply, from_pdf=False, confident=False)
+<<<<<<< HEAD
         _enqueue_deferred(sender, user_text)  # defer profile extraction only
+=======
+>>>>>>> 783b833 (Update: bot code)
         return twiml_message(reply)
 
     # From here on, we can afford a bit more work
@@ -701,14 +844,20 @@ def whatsapp_reply():
     # summary was refreshed earlier; read whatever we have
     summary = CONV_SUMMARY.get(sender, "")
 
+<<<<<<< HEAD
     # --- Decide RAG cheaply, then make exactly one chat call ---
     confident = False  # kept for logging compatibility
+=======
+        # --- Gate RAG BEFORE any retrieval; otherwise skip embeddings entirely ---
+
+>>>>>>> 783b833 (Update: bot code)
     use_rag = False
     docs = []
     top = None
     top_src = None
     retrieval_ms = None
 
+<<<<<<< HEAD
     # Time-boxed retrieval gate
     try:
         tR = time.time()
@@ -757,6 +906,59 @@ def whatsapp_reply():
         txt = rag_answer_from_posts(sender, eq, docs)
     else:
         txt = best_practice_answer(sender, user_text)
+=======
+    # broaden trigger
+    force_rag_hint = is_menu_pick or wants_rag(user_text) or (len(user_text) >= 80)
+
+    if force_rag_hint and (elapsed() < TURN_BUDGET * 0.4):
+        try:
+            tR = time.time()
+            res = _query_chroma_cached([user_text], K)
+            retrieval_ms = int((time.time() - tR) * 1000)
+
+            dists = (res.get("distances", [[]]) or [[]])[0]
+            docs  = (res.get("documents", [[]]) or [[]])[0]
+            metas = (res.get("metadatas", [[]]) or [[]])[0]
+
+            top = dists[0] if dists else None
+            top_src = (metas[0].get("source") if metas and isinstance(metas[0], dict) else None)
+
+            # overlap across top-3 chunks (>=1 common 4+ letter word)
+            def _ov(q, d):
+                qw = set(re.findall(r"[a-zA-Z]{4,}", (q or "").lower()))
+                dw = set(re.findall(r"[a-zA-Z]{4,}", (d or "").lower()))
+                return len(qw & dw)
+            ov = max((_ov(user_text, d) for d in docs[:3]), default=0)
+
+            confident = (
+                top is not None and
+                top <= CONF_DIST and      # try 0.60
+                bool(docs) and
+                ov >= 1 and               # was 2 on only docs[0]
+                (retrieval_ms is not None) and
+                ((retrieval_ms / 1000.0) <= RETRIEVAL_TIME_BUDGET)
+            )
+            use_rag = confident
+
+            if DEBUG:
+                app.logger.info("[rag-gate] hint=%s top=%s ov=%s src=%s t_ms=%s use=%s",
+                                force_rag_hint,
+                                (round(top,3) if top is not None else None),
+                                ov, top_src, retrieval_ms, use_rag)
+        except Exception:
+            app.logger.exception("retrieval error")
+            use_rag = False
+            docs = []; top = None; top_src = None; retrieval_ms = None
+        
+
+    # Build query with whatever summary we already have
+    eq = build_effective_query(user_text, profile, summary)
+
+    # Exactly ONE chat-completion:
+    eq = build_effective_query(user_text, profile, summary)
+    txt = rag_answer_from_posts(sender, eq, docs) if use_rag else best_practice_answer(sender, user_text)
+
+>>>>>>> 783b833 (Update: bot code)
 
     # Post-process + reply
     txt = enforce_numbered_lines(txt)
@@ -765,9 +967,15 @@ def whatsapp_reply():
     if DEBUG:
         reply += (
             f"\n\n[diag] rag={'yes' if use_rag else 'no'}"
+<<<<<<< HEAD
             f"{' top=' + str(round(top,3)) if top is not None else ''}"
             f"{' src=' + top_src if top_src else ''}"
             f"{' t=' + str(retrieval_ms) + 'ms' if retrieval_ms is not None else ''}"
+=======
+            f"{' top=' + str(round(top,3)) if (use_rag and top is not None) else ''}"
+            f"{' src=' + top_src if (use_rag and top_src) else ''}"
+            f"{' t=' + str(retrieval_ms) + 'ms' if (use_rag and retrieval_ms is not None) else ''}"
+>>>>>>> 783b833 (Update: bot code)
         )
 
     remember_turn(sender, "assistant", reply)
@@ -778,10 +986,17 @@ def whatsapp_reply():
         top_source=top_src if use_rag else None,
         retrieval_ms=retrieval_ms if use_rag else None
     )
+<<<<<<< HEAD
     _enqueue_deferred(sender, user_text)
     return twiml_message(reply)
 
 
+=======
+    return twiml_message(reply)
+
+
+
+>>>>>>> 783b833 (Update: bot code)
 @app.route("/stats", methods=["GET"])
 def stats():
     token = request.args.get("token", "")

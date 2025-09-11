@@ -50,3 +50,10 @@
 {"question": "Give me the list of most frequently asked behavioral interview questions, strategically categorized to\nhelp prepare your STAR stories:", "from_pdf": true, "confident": true, "answer_len": 253, "top_dist": 0.2470632791519165, "top_source": "The Ultimate Interview Preparation Guide (1) (1).pdf", "retrieval_ms": 274, "ts": "2025-09-10T02:54:09.350914Z", "sender_masked": "u_38833f4fb3"}
 {"question": "Leadership & Initiative", "from_pdf": false, "confident": false, "answer_len": 333, "top_dist": null, "top_source": null, "retrieval_ms": null, "ts": "2025-09-10T02:54:28.354472Z", "sender_masked": "u_38833f4fb3"}
 {"question": "category: Leadership & Initiative", "from_pdf": false, "confident": false, "answer_len": 328, "top_dist": null, "top_source": null, "retrieval_ms": null, "ts": "2025-09-10T02:54:56.967237Z", "sender_masked": "u_38833f4fb3"}
+<<<<<<< HEAD
+=======
+{"question": "How do I use the STAR method to answer behavioral questions?", "from_pdf": false, "confident": false, "answer_len": 416, "top_dist": null, "top_source": null, "retrieval_ms": null, "ts": "2025-09-11T01:00:38.115160Z", "sender_masked": "u_38833f4fb3"}
+{"question": "Can help me draft a cold email to a recruiter as she is hiring for a Product Manager role?", "from_pdf": false, "confident": false, "answer_len": 582, "top_dist": null, "top_source": null, "retrieval_ms": null, "ts": "2025-09-11T01:00:55.761951Z", "sender_masked": "u_38833f4fb3"}
+{"question": "Replace the recruiters name to Harshit and my name to Margil", "from_pdf": false, "confident": false, "answer_len": 143, "top_dist": null, "top_source": null, "retrieval_ms": null, "ts": "2025-09-11T01:01:30.397545Z", "sender_masked": "u_38833f4fb3"}
+{"question": "Replace the recruiters name to Harshit and my name to Margil in the cold email above", "from_pdf": false, "confident": false, "answer_len": 367, "top_dist": null, "top_source": null, "retrieval_ms": null, "ts": "2025-09-11T01:01:59.946996Z", "sender_masked": "u_38833f4fb3"}
+>>>>>>> 783b833 (Update: bot code)
