@@ -29,9 +29,7 @@ def _mask_sender(sender: str) -> str:
     h = hashlib.sha256((sender or "").encode()).hexdigest()
     return f"u_{h[:10]}"
 
-# Insert a newline before inline numbered items like " 1. " or " 2) "
-LISTIFY_RE = re.compile(r'(?<!\n)\s(\d{1,2}[.)])\s')
-
+# Insert a newline before inline numbered items like " 1. " or " 2) "; also fix dup lines
 LISTIFY_RE = re.compile(r'(?<!\n)\s(\d{1,3}[.)])\s')
 _DUP_PREFIX = re.compile(r'(?m)^\s*(\d{1,3}[.)])\s+\1\s+')
 _LONE_NUM_LINE = re.compile(r'(?m)^\s*\d{1,3}[.)]\s*$')
@@ -50,7 +48,6 @@ def enforce_numbered_lines(text: str) -> str:
     # tidy blank lines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
-
 
 def sanitize_plain(text: str) -> str:
     if not text:
@@ -99,47 +96,13 @@ def _log_writer():
             except Exception:
                 pass
 
-<<<<<<< HEAD
 threading.Thread(target=_log_writer, daemon=True).start()
 
-=======
->>>>>>> 783b833 (Update: bot code)
 def log_interaction(sender: str, payload: dict):
     try:
         _LOG_QUEUE.put_nowait((sender, payload))
     except Exception:
         print("log_interaction: queue full; dropping log line.")
-
-<<<<<<< HEAD
-# --- Defer only profile extraction (no summarization here) ---
-_DEFER_QUEUE: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=1000)
-
-def _defer_worker():
-    """Background worker: extract profile fields from messages without blocking the webhook."""
-    while True:
-        try:
-            sender, user_text = _DEFER_QUEUE.get()
-            if not sender or not user_text:
-                continue
-
-            # Only run if the message looks like it contains profile info
-            if _looks_like_profile_update(user_text):
-                try:
-                    extract_profile_updates(sender, user_text)
-                except Exception as e:
-                    print("defer extract_profile_updates error:", e)
-
-        except Exception as e:
-            print("defer worker error:", e)
-        finally:
-            try:
-                _DEFER_QUEUE.task_done()
-            except Exception:
-                pass
-
-threading.Thread(target=_defer_worker, daemon=True).start()
-=======
->>>>>>> 783b833 (Update: bot code)
 
 # ==================== Flask ====================
 app = Flask(__name__)
@@ -156,7 +119,7 @@ CHOICE_WINDOW = 60         # seconds
 
 # Retrieval / budget tuning
 K = int(os.getenv("K", "4"))
-CONF_DIST = float(os.getenv("CONF_DIST", "0.40"))   # tuned for cosine distance; smaller is better
+CONF_DIST = float(os.getenv("CONF_DIST", "0.60"))   # cosine distance (smaller is better)
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "400"))
 RETRIEVAL_BUDGET = float(os.getenv("RETRIEVAL_BUDGET", "1.5"))      # token multiplier
 RETRIEVAL_TIME_BUDGET = float(os.getenv("RETRIEVAL_TIME_BUDGET", "5.0"))  # seconds
@@ -177,8 +140,8 @@ collection = chroma_client.get_or_create_collection(
     name=COLLECTION,
     embedding_function=openai_ef,
     metadata={
-        "hnsw:space": "cosine",       # <-- sets cosine distance
-        "embed_model": EMBED_MODEL,   # keep model alignment info
+        "hnsw:space": "cosine",       # <-- cosine distance
+        "embed_model": EMBED_MODEL,
     },
 )
 
@@ -192,7 +155,6 @@ class SenderMap(dict):
         self.order = OrderedDict()
         self.max_senders = max_senders
         self.lock = threading.Lock()
-
     def touch(self, sender):
         with self.lock:
             self.order.pop(sender, None)
@@ -233,7 +195,6 @@ class LRUCache(OrderedDict):
             if key in self:
                 self.move_to_end(key)
                 return self[key]
-        # compute outside lock to avoid blocking others
         value = compute_fn()
         with _cache_lock:
             self[key] = value
@@ -274,160 +235,25 @@ def safe_chat_completion(model, messages, temperature=None, max_tokens=None):
         kwargs["temperature"] = temperature
     return openai_client.chat.completions.create(**kwargs)
 
-def rough_keyword_match(q: str, doc: str, min_overlap: int = 2) -> bool:
-    q_words = set(re.findall(r"[a-zA-Z]{4,}", (q or "").lower()))
-    d_words = set(re.findall(r"[a-zA-Z]{4,}", (doc or "").lower()))
-    return len(q_words & d_words) >= min_overlap
-
-def summarize_history(sender: str, max_turns: int = 4, max_words: int = 40) -> str:
-    """
-    Produce a 1–2 sentence running summary of the conversation.
-    - Pulls only the last `max_turns` exchanges to keep the prompt tiny.
-    - Returns previous summary on any error (never blocks the reply).
-    """
-    try:
-        last = CONV_HISTORY.get(sender, [])[-max_turns:]
-        prior = CONV_SUMMARY.get(sender, "")
-
-        sys = (
-            "You maintain a concise running summary (<= {mw} words) for a careers chat. "
-            "Capture: target role, level, industry, location, key constraints, and current topic. "
-            "Be factual, no fluff.".format(mw=max_words)
-        )
-        user = (
-            f"Prior summary:\n{prior}\n\n"
-            "Recent messages (role: text):\n" +
-            "\n".join(f"{t['role']}: {t['text']}" for t in last) +
-            f"\n\nUpdate the summary in <= {max_words} words."
-        )
-
-        chat = safe_chat_completion(
-            CHAT_MODEL,
-            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-            temperature=0.2
-        )
-        new_summary = (chat.choices[0].message.content or "").strip()
-        if not new_summary:
-            return prior
-        CONV_SUMMARY[sender] = new_summary
-        CONV_SUMMARY.touch(sender)
-        if DEBUG:
-            print("[summary]", new_summary)
-        return new_summary
-
-    except Exception as e:
-        if DEBUG:
-            print("summarize_history error:", e)
-        return CONV_SUMMARY.get(sender, "")
-
-PROFILE_HINT_RE = re.compile(
-    r"\b(role|title|position|level|senior|junior|intern|manager|lead|location|remote|onsite|"
-    r"city|country|years|experience|exp|industry|domain|goal|target|aim|looking for|"
-    r"switch|transition|linkedin|portfolio|resume|cv|github|url|http[s]?://)\b",
-    re.IGNORECASE,
-)
-<<<<<<< HEAD
-def _looks_like_profile_update(text: str) -> bool:
-    return bool(text and PROFILE_HINT_RE.search(text))
-
-def extract_profile_updates(sender: str, user_text: str) -> None:
-    """
-    Pulls structured profile info from the user's message and merges it into USER_PROFILE[sender].
-    Keys: role, level, location, years, industry, goals, links.
-    - Skips OpenAI call unless the text looks relevant (cheap heuristic).
-    - Uses a tiny JSON-only prompt and tolerates bad JSON.
-    - Never raises; on any error, does nothing.
-    """
-    try:
-        if not user_text or not _looks_like_profile_update(user_text):
-            return
-
-        prof = get_profile(sender)
-
-        sys = (
-            "Extract a careers profile from the user's SINGLE message. "
-            "Return STRICT JSON ONLY (no code fences). "
-            "Allowed keys: role, level, location, years, industry, goals, links. "
-            "Rules:\n"
-            "- 'years' should be a number if stated (e.g., 3, 5.5), else omit.\n"
-            "- 'links' must be a list of URLs if present.\n"
-            "- Omit any key you cannot infer from THIS message alone."
-        )
-        user = f"User message:\n{user_text}\n\nReturn JSON only."
-
-        chat = safe_chat_completion(
-            CHAT_MODEL,
-            messages=[{"role": "system", "content": sys},
-                      {"role": "user", "content": user}],
-            temperature=0.1
-        )
-
-        raw = (chat.choices[0].message.content or "").strip()
-
-        # --- Parse JSON defensively ---
-        try:
-            data = json.loads(raw)
-        except Exception:
-            m = re.search(r"\{.*\}", raw, flags=re.S)
-            data = json.loads(m.group(0)) if m else {}
-
-        if not isinstance(data, dict):
-            return
-
-        def _clean_url(u: str) -> str | None:
-            if not isinstance(u, str):
-                return None
-            u = u.strip()
-            if not u:
-                return None
-            if not re.match(r"^https?://", u, flags=re.I):
-                if re.match(r"^[\w.-]+\.[a-z]{2,}(/.*)?$", u, flags=re.I):
-                    u = "https://" + u
-                else:
-                    return None
-            return u
-
-        # Merge links (dedupe)
-        if "links" in data and isinstance(data["links"], list):
-            new_links = []
-            for u in data["links"]:
-                cu = _clean_url(u)
-                if cu:
-                    new_links.append(cu)
-            if new_links:
-                prof_links = set(prof.get("links", []) or [])
-                prof["links"] = list(prof_links.union(new_links))
-
-        # Merge scalar fields if present & non-empty
-        for key in ("role", "level", "location", "industry", "goals"):
-            val = data.get(key)
-            if isinstance(val, str) and val.strip():
-                prof[key] = val.strip()
-
-        # years → numeric if possible
-        yrs = data.get("years")
-        if isinstance(yrs, (int, float)):
-            prof["years"] = yrs
-        elif isinstance(yrs, str):
-            yrs_m = re.search(r"\d+(\.\d+)?", yrs)
-            if yrs_m:
-                try:
-                    prof["years"] = float(yrs_m.group(0))
-                except Exception:
-                    pass
-
-        USER_PROFILE[sender] = prof
-        USER_PROFILE.touch(sender)
-
-        if DEBUG:
-            print("[profile]", json.dumps(prof, ensure_ascii=False))
-
-    except Exception as e:
-        if DEBUG:
-            print("extract_profile_updates error:", e)
-        return
-=======
->>>>>>> 783b833 (Update: bot code)
+def _normalize_to_text(value) -> str:
+    """Strings pass through. Lists → numbered lines (strip any bullets/nums)."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        lines = []
+        for i, item in enumerate(value, 1):
+            s = str(item).strip()
+            # remove leading bullets or numbering once
+            s = re.sub(r'^\s*(?:\d{1,3}[.)]|[-–—•●*·])\s+', '', s)
+            if s:
+                lines.append(f"{i}. {s}")
+        return "\n".join(lines)
+    if isinstance(value, dict):
+        # best-effort compact
+        return ", ".join(f"{k}: {v}" for k, v in value.items())
+    return str(value)
 
 def build_effective_query(user_msg: str, profile: dict, summary: str) -> str:
     parts = [user_msg]
@@ -449,7 +275,6 @@ def _budgeted_context(docs: list[str]) -> str:
     total_token_budget = int(RETRIEVAL_BUDGET * MAX_TOKENS)
     total_word_budget  = max(200, int(total_token_budget / AVG_TOKENS_PER_WORD))
     per_chunk_cap = max(220, int(total_word_budget * 0.45))
-
     kept, used = [], 0
     for d in docs:
         if used >= total_word_budget:
@@ -462,31 +287,12 @@ def _budgeted_context(docs: list[str]) -> str:
             used += len(piece.split())
     return "\n\n".join(kept)
 
-def _normalize_to_text(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        lines = []
-        for i, item in enumerate(value, 1):
-            s = str(item).strip()
-            # remove leading bullets or numbering once
-            s = re.sub(r'^\s*(?:[-–—•●*·]|\d{1,3}[.)])\s+', '', s)
-            if s:
-                lines.append(f"{i}. {s}")
-        return "\n".join(lines)
-    return str(value)
-
-<<<<<<< HEAD
-=======
 def _merge_profile(sender: str, data: dict):
     """Merge optional 'profile' dict from model output into USER_PROFILE inline."""
     if not isinstance(data, dict):
         return
     prof = get_profile(sender)
 
-    # links (dedupe + normalize)
     links = data.get("links")
     if isinstance(links, list):
         clean = []
@@ -504,13 +310,11 @@ def _merge_profile(sender: str, data: dict):
         if clean:
             prof["links"] = list(set((prof.get("links") or []) + clean))
 
-    # scalar fields
     for k in ("role", "level", "location", "industry", "goals"):
         v = data.get(k)
         if isinstance(v, str) and v.strip():
             prof[k] = v.strip()
 
-    # years
     y = data.get("years")
     if isinstance(y, (int, float)):
         prof["years"] = float(y)
@@ -525,37 +329,9 @@ def _merge_profile(sender: str, data: dict):
     USER_PROFILE[sender] = prof
     if hasattr(USER_PROFILE, "touch"):
         USER_PROFILE.touch(sender)
->>>>>>> 783b833 (Update: bot code)
-
 
 def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 40) -> str:
     """
-<<<<<<< HEAD
-    Parse a single-call model response that contains both the 'answer' and a compact 'summary'.
-    Updates CONV_SUMMARY[sender] inline; returns just the answer text (always a string).
-    Accepts JSON {"answer": ..., "summary": "..."} or a fallback ANSWER/SUMMARY block.
-    """
-    ans, summ = None, None
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            ans = obj.get("answer")
-            summ = obj.get("summary")
-    except Exception:
-        pass
-
-    if ans is None:
-        # Fallback to labeled blocks, robust to minor formatting
-        m_ans = re.search(r"ANSWER:\s*(.+?)(?:\n\s*SUMMARY:|\Z)", raw, re.S | re.I)
-        if m_ans:
-            ans = m_ans.group(1).strip()
-        else:
-            ans = raw.strip()
-
-    # Normalize answer to string (handles lists/dicts/etc.)
-    ans = _normalize_to_text(ans)
-
-=======
     Parse model output returning JSON {answer, summary, profile?}.
     - Updates CONV_SUMMARY inline from 'summary'.
     - Merges optional 'profile' into USER_PROFILE inline.
@@ -584,17 +360,12 @@ def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 4
     ans = _normalize_to_text(ans)
 
     # Pull summary if missing in JSON and present in blocks
->>>>>>> 783b833 (Update: bot code)
     if not summ:
         m_sum = re.search(r"SUMMARY:\s*(.+)$", raw, re.S | re.I)
         if m_sum:
             summ = m_sum.group(1).strip()
 
-<<<<<<< HEAD
-    # Ensure summary is a short string
-=======
     # Ensure summary is short string and store
->>>>>>> 783b833 (Update: bot code)
     if isinstance(summ, (list, dict, int, float)):
         summ = _normalize_to_text(summ)
     if summ:
@@ -605,31 +376,10 @@ def _extract_answer_and_update_summary(sender: str, raw: str, max_words: int = 4
 
     return ans
 
-<<<<<<< HEAD
-
-    # Clip and store the summary inline (keeps personalization fresh with zero extra calls)
-    if summ:
-        summ = clip_words(summ, max_words)
-        CONV_SUMMARY[sender] = summ
-        if hasattr(CONV_SUMMARY, "touch"):
-            CONV_SUMMARY.touch(sender)
-
-    return ans
-
-=======
->>>>>>> 783b833 (Update: bot code)
 def rag_answer_from_posts(sender: str, question: str, docs: list[str]) -> str:
     try:
         context = _budgeted_context(docs)
         sys = (
-<<<<<<< HEAD
-            "You are Margil Gandhi’s assistant. Use ONLY the provided context."
-            " Return STRICT JSON with keys: answer, summary.\n"
-            " - 'answer': the concise reply for the user (<= {mx} tokens).\n"
-            " - 'summary': <= 40 words updating the conversation state "
-            "(target role/level/industry/location/constraints/current topic)."
-        ).format(mx=MAX_TOKENS)
-=======
             "You are Margil Gandhi’s assistant. Use ONLY the provided context. "
             "Return STRICT JSON with keys: answer, summary, profile (optional). "
             "Formatting rules for 'answer': "
@@ -642,9 +392,7 @@ def rag_answer_from_posts(sender: str, question: str, docs: list[str]) -> str:
             "'summary': <= 40 words capturing role/level/industry/location/constraints/topic. "
             "'profile' (optional): {role, level, location, years, industry, goals, links}. "
             "JSON only."
-        ).format(mx=MAX_TOKENS)
-
->>>>>>> 783b833 (Update: bot code)
+        )
         user = f"Context:\n{context}\n\nQuestion: {question}\n\nReturn JSON only."
         chat = safe_chat_completion(
             CHAT_MODEL,
@@ -656,16 +404,6 @@ def rag_answer_from_posts(sender: str, question: str, docs: list[str]) -> str:
     except Exception as e:
         if DEBUG: print("rag_answer_from_posts error:", e)
         return "Sorry—I ran into an issue using the PDF context. Try asking again in a moment."
-
-<<<<<<< HEAD
-def best_practice_answer(sender: str, query: str) -> str:
-    try:
-        sys = (
-            "You are a careers/job-search assistant. Return STRICT JSON with keys: answer, summary.\n"
-            " - 'answer': direct, concise; numbered list with ONE item per line when listing.\n"
-            " - 'summary': <= 40 words updating the conversation state (role/level/industry/location/constraints/topic)."
-        )
-=======
 
 def best_practice_answer(sender: str, query: str) -> str:
     try:
@@ -683,8 +421,6 @@ def best_practice_answer(sender: str, query: str) -> str:
             "'profile' (optional): {role, level, location, years, industry, goals, links}. "
             "JSON only."
         )
-
->>>>>>> 783b833 (Update: bot code)
         chat = safe_chat_completion(
             CHAT_MODEL,
             messages=[{"role":"system","content":sys},{"role":"user","content":query}],
@@ -696,25 +432,17 @@ def best_practice_answer(sender: str, query: str) -> str:
         if DEBUG: print("best_practice_answer error:", e)
         return "Sorry—I’m a bit busy right now. Please try again."
 
-<<<<<<< HEAD
-=======
-
->>>>>>> 783b833 (Update: bot code)
-# ---- heuristics to control expensive work ----
+# ---- heuristics ----
 def looks_generic(msg: str) -> bool:
     if not msg: return True
     m = msg.strip().lower()
     if len(m) < 20:
         return True
-    # only treat "tips/advice/help" as generic when *very short*
     return any(w in m for w in ["help", "tips", "advice", "how to start"]) and len(m) < 80
 
 def wants_rag(msg: str) -> bool:
-    if not msg:
-        return False
+    if not msg: return False
     m = msg.lower()
-    if len(m) >= 120:
-        return True
     return any(k in m for k in [
         "from my posts", "as i wrote", "from the pdf", "context above",
         "according to your post", "based on your guide"
@@ -729,7 +457,6 @@ def map_menu_choice_to_query(text: str, sender: str | None = None) -> str | None
         if sender:
             LAST_MENU_AT[sender] = time.time()
         return "__MENU__"
-
     m = re.match(r'^\s*(\d+)\s*\)?\s*$', t)
     if m and sender:
         if time.time() - LAST_MENU_AT.get(sender, 0) <= CHOICE_WINDOW:
@@ -738,26 +465,16 @@ def map_menu_choice_to_query(text: str, sender: str | None = None) -> str | None
                 return WELCOME_QUESTIONS[i]
     return None
 
-<<<<<<< HEAD
-def _enqueue_deferred(sender: str, user_text: str):
-    try:
-        _DEFER_QUEUE.put_nowait((sender, user_text))
-    except Exception:
-        # If saturated, skip deferred work rather than affecting next turn latency
-        pass
-=======
->>>>>>> 783b833 (Update: bot code)
-
 def _log_reply(sender, question, reply_text, from_pdf, confident,
                top_dist=None, top_source=None, retrieval_ms=None):
     log_interaction(sender, {
         "question": question,
-        "from_pdf": from_pdf,           # True if RAG answer path used
+        "from_pdf": from_pdf,
         "confident": confident,
         "answer_len": len(reply_text),
-        "top_dist": top_dist,           # float or None
-        "top_source": top_source,       # e.g., PDF filename
-        "retrieval_ms": retrieval_ms,   # int ms or None
+        "top_dist": top_dist,
+        "top_source": top_source,
+        "retrieval_ms": retrieval_ms,
     })
 
 # ==================== Retrieval with cache ====================
@@ -766,7 +483,7 @@ def _query_chroma_cached(q_texts, n_results):
         return collection.query(
             query_texts=q_texts,
             n_results=n_results,
-            include=["documents", "distances", "metadatas"],  # ← important
+            include=["documents", "distances", "metadatas"],
         )
     key = (tuple(q_texts), n_results)
     return _CHROMA_CACHE.get_set(key, _compute)
@@ -796,7 +513,7 @@ def whatsapp_reply():
     if user_text.lower() == "ping":
         return twiml_message("pong")
 
-    # Menu/help handling (within window logic)
+    # Menu/help handling
     choice = map_menu_choice_to_query(user_text, sender)
     if choice == "__MENU__" or (is_first_turn(sender) and not user_text):
         WELCOME_SEEN.add(sender)
@@ -816,98 +533,33 @@ def whatsapp_reply():
     if is_menu_pick:
         user_text = mapped
 
-    # --- ALWAYS record user turn + (optionally) refresh summary inline ---
+    # Record user turn
     remember_turn(sender, "user", user_text)
 
-
-    # EARLY EXIT BEFORE ANY LLM HEAVY WORK
+    # EARLY EXIT for generic
     if looks_generic(user_text):
         txt = best_practice_answer(sender, user_text)
-        txt = enforce_numbered_lines(txt)
-        reply = sanitize_plain(txt)
+        reply = sanitize_plain(enforce_numbered_lines(txt))
         remember_turn(sender, "assistant", reply)
         _log_reply(sender, user_text, reply, from_pdf=False, confident=False)
-<<<<<<< HEAD
-        _enqueue_deferred(sender, user_text)  # defer profile extraction only
-=======
->>>>>>> 783b833 (Update: bot code)
         return twiml_message(reply)
 
-    # From here on, we can afford a bit more work
     elapsed = lambda: time.time() - t0
 
-    # ---- Cheap context (make sure these exist) ----
+    # Cheap context objects
     try:
         profile = get_profile(sender)
     except Exception:
         profile = {}
-    # summary was refreshed earlier; read whatever we have
     summary = CONV_SUMMARY.get(sender, "")
 
-<<<<<<< HEAD
-    # --- Decide RAG cheaply, then make exactly one chat call ---
-    confident = False  # kept for logging compatibility
-=======
-        # --- Gate RAG BEFORE any retrieval; otherwise skip embeddings entirely ---
-
->>>>>>> 783b833 (Update: bot code)
+    # --------- RAG gate (skip embeddings unless hints are strong) ----------
     use_rag = False
     docs = []
     top = None
     top_src = None
     retrieval_ms = None
 
-<<<<<<< HEAD
-    # Time-boxed retrieval gate
-    try:
-        tR = time.time()
-        res = _query_chroma_cached([user_text], K)  # includes metadatas
-        retrieval_ms = int((time.time() - tR) * 1000)
-
-        dists = (res.get("distances", [[]]) or [[]])[0]
-        docs  = (res.get("documents", [[]]) or [[]])[0]
-        metas = (res.get("metadatas", [[]]) or [[]])[0]
-
-        top = dists[0] if dists else None
-        top_src = (metas[0].get("source") if metas and isinstance(metas[0], dict) else None)
-
-        app.logger.info(
-            "[rag] top_dist=%s src=%s k=%d time_ms=%s",
-            (round(top, 3) if top is not None else None),
-            top_src, K, retrieval_ms
-        )
-
-        # confidence gate (smaller distance is better for cosine)
-        confident = (
-            top is not None and
-            top <= CONF_DIST and
-            bool(docs) and
-            rough_keyword_match(user_text, docs[0])
-        )
-
-        # latency guard – only use RAG if retrieval stayed within budget
-        if confident and (retrieval_ms is not None) and ((retrieval_ms / 1000.0) <= RETRIEVAL_TIME_BUDGET):
-            use_rag = True
-
-    except Exception:
-        app.logger.exception("retrieval error")
-        confident = False
-        use_rag = False
-        docs = []
-        top = None
-        top_src = None
-        retrieval_ms = None
-
-    # Build effective query with whatever summary we already have
-    eq = build_effective_query(user_text, profile, summary)
-
-    # Exactly ONE chat-completion:
-    if use_rag:
-        txt = rag_answer_from_posts(sender, eq, docs)
-    else:
-        txt = best_practice_answer(sender, user_text)
-=======
-    # broaden trigger
     force_rag_hint = is_menu_pick or wants_rag(user_text) or (len(user_text) >= 80)
 
     if force_rag_hint and (elapsed() < TURN_BUDGET * 0.4):
@@ -932,9 +584,9 @@ def whatsapp_reply():
 
             confident = (
                 top is not None and
-                top <= CONF_DIST and      # try 0.60
+                top <= CONF_DIST and     # try default 0.60; override via env if needed
                 bool(docs) and
-                ov >= 1 and               # was 2 on only docs[0]
+                ov >= 1 and
                 (retrieval_ms is not None) and
                 ((retrieval_ms / 1000.0) <= RETRIEVAL_TIME_BUDGET)
             )
@@ -949,33 +601,20 @@ def whatsapp_reply():
             app.logger.exception("retrieval error")
             use_rag = False
             docs = []; top = None; top_src = None; retrieval_ms = None
-        
 
-    # Build query with whatever summary we already have
-    eq = build_effective_query(user_text, profile, summary)
-
-    # Exactly ONE chat-completion:
+    # ----- Exactly one chat call -----
     eq = build_effective_query(user_text, profile, summary)
     txt = rag_answer_from_posts(sender, eq, docs) if use_rag else best_practice_answer(sender, user_text)
 
->>>>>>> 783b833 (Update: bot code)
-
     # Post-process + reply
-    txt = enforce_numbered_lines(txt)
-    reply = sanitize_plain(txt)
+    reply = sanitize_plain(enforce_numbered_lines(txt))
 
     if DEBUG:
         reply += (
             f"\n\n[diag] rag={'yes' if use_rag else 'no'}"
-<<<<<<< HEAD
-            f"{' top=' + str(round(top,3)) if top is not None else ''}"
-            f"{' src=' + top_src if top_src else ''}"
-            f"{' t=' + str(retrieval_ms) + 'ms' if retrieval_ms is not None else ''}"
-=======
             f"{' top=' + str(round(top,3)) if (use_rag and top is not None) else ''}"
             f"{' src=' + top_src if (use_rag and top_src) else ''}"
             f"{' t=' + str(retrieval_ms) + 'ms' if (use_rag and retrieval_ms is not None) else ''}"
->>>>>>> 783b833 (Update: bot code)
         )
 
     remember_turn(sender, "assistant", reply)
@@ -986,17 +625,8 @@ def whatsapp_reply():
         top_source=top_src if use_rag else None,
         retrieval_ms=retrieval_ms if use_rag else None
     )
-<<<<<<< HEAD
-    _enqueue_deferred(sender, user_text)
     return twiml_message(reply)
 
-
-=======
-    return twiml_message(reply)
-
-
-
->>>>>>> 783b833 (Update: bot code)
 @app.route("/stats", methods=["GET"])
 def stats():
     token = request.args.get("token", "")
@@ -1036,7 +666,6 @@ if __name__ == "__main__":
         count = collection.count() if hasattr(collection, "count") else "n/a"
         print(f"Chroma collection '{COLLECTION}' count:", count)
         if DEBUG:
-            # Quick note to validate distance semantics empirically if needed
             print("Note: CONF_DIST assumes cosine distance (smaller is better).")
     except Exception as e:
         print("Could not count Chroma docs:", e)
